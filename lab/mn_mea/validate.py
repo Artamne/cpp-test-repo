@@ -61,6 +61,13 @@ DEMO_GEOMETRY = A.Geometry(
 MU_MEASURED = 1.0e-3
 
 
+def _floor_for(backend, h) -> float:
+    """Порог решения №1 для блока h — (5-4) плюс power_floor, как в iterate_block.
+    Принимает бэкенд и данные блока; возвращает порог мощности."""
+    M, N = h.shape
+    return C.power_floor(C.total_energy(backend, backend.xp.abs(h) ** 2, M), M, N)
+
+
 def centred_bin_index(M: int) -> np.ndarray:
     """Номер доплеровского бина в ЦЕНТРИРОВАННОМ представлении:
     k~ = -M/2 … M/2-1 вместо 0 … M-1.
@@ -342,7 +349,8 @@ def experiment_normalisation() -> dict:
         h = SY.range_doppler_from_scene(backend, sc.image, phi_err)
         phi = backend.asarray(np.zeros(M))
         h_phi, g = C.image_from_phase(backend, h, phi)
-        floor = C.power_floor(backend, h)
+        h_abs2 = backend.xp.abs(h) ** 2
+        floor = C.power_floor(C.total_energy(backend, h_abs2, M), M, N)
         P, ln_P, _ = C.image_power(backend, g, floor)
         G = C.auxiliary_array(backend, ln_P, g)
         W = C.w_product(backend, G, h_phi)
@@ -827,7 +835,7 @@ def experiment_ambiguity_basis() -> dict:
 
     def normalised_entropy(phi: np.ndarray) -> float:
         _, g = C.image_from_phase(backend, h, backend.asarray(phi))
-        P, _, _ = C.image_power(backend, g, C.power_floor(backend, h))
+        P, _, _ = C.image_power(backend, g, _floor_for(backend, h))
         return C.entropy(backend, P, float(backend.sum_real(P)))[1]
 
     k_centred = centred_bin_index(M)
@@ -879,7 +887,7 @@ def experiment_entropy_versus_truth() -> list[dict]:
 
             def normalised_entropy(phi: np.ndarray) -> float:
                 _, g = C.image_from_phase(backend, h, backend.asarray(phi))
-                P, _, _ = C.image_power(backend, g, C.power_floor(backend, h))
+                P, _, _ = C.image_power(backend, g, _floor_for(backend, h))
                 return C.entropy(backend, P, float(backend.sum_real(P)))[1]
 
             result = C.iterate_block(backend, h, np.zeros(M), mu=MU_MEASURED)
