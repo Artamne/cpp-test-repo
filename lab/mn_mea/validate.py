@@ -28,6 +28,7 @@
     experiment_block_transform       §5           длина (5-3): блок или сцена
     experiment_image_shift           решение №5   снятие сдвига блока
     experiment_block_window          решение №6   перехлёст окна и нули
+    experiment_space_invariance                   чего стенд НЕ проверяет
     experiment_method_summary                     сводка: что дал каждый способ
     experiment_full_run              §10.4        A->B->C->D целиком
 """
@@ -1031,6 +1032,52 @@ def experiment_image_shift(
             "mean_entropy": entropy_shift,
         }
     return rows
+
+
+def experiment_space_invariance(seed: int = 20250915) -> dict:
+    """Чего стенд НЕ проверяет: пространственную изменчивость фазы.
+
+    Вносимая ошибка (synthetic.phase_error) — ОДИН вектор на всю сцену, и
+    range_doppler_from_scene домножает им все стробы дальности одинаково.
+    Изменчивости, ради которой книга и делит сцену на блоки (§3), в данных
+    нет вовсе.
+
+    Показывается это так: сцена считается ОДНИМ блоком во всю апертуру, то
+    есть при q = 1, и сравнивается с книжным разбиением на q блоков. При
+    неизменчивой ошибке один блок обязан выиграть — ему достаётся вся
+    апертура и всё содержимое сцены, а делить нечего.
+
+    Опыт не спор с книгой и не довод против разбиения. Он говорит ровно одно:
+    пока стенд таков, этапы A и B на нём НЕ ПРОВЕРЯЮТСЯ, и всякий вывод об их
+    качестве, сделанный по этим числам, будет о чём-то другом. См. README,
+    «Чего в этой работе НЕТ», пункт 1.
+    """
+    backend = get_backend("auto")
+    M, N, geom = 256, 96, DEMO_GEOMETRY
+    rng = np.random.default_rng(seed)
+    sc = SY.scene("points_and_clutter", M, N, rng, n_points=12)
+    phi_err = SY.phase_error("mixture", M, 3.0, rng, T_a=geom.T_a)
+    h = backend.asarray(SY.range_doppler_from_scene(backend, sc.image, phi_err))
+
+    result = C.iterate_block(backend, h, np.zeros(M), mu=MU_MEASURED)
+    whole = D.block_image(backend, h, D.remove_image_shift(backend, result.phi))
+
+    run = experiment_full_run(seed=seed)
+    return {
+        "single_block": {
+            "converged": result.converged,
+            "iterations": result.n_iterations,
+            "residual_rms_rad": phase_residual_rms(phi_err, result.phi),
+            **image_sharpness(backend, whole),
+        },
+        "book_split": {
+            "converged": f"{run['converged_blocks']}/{run['q']}",
+            "iterations": float(np.mean([b["iterations"] for b in run["per_block"]])),
+            "residual_rms_rad": run["mean_residual_rms_rad"],
+            **image_sharpness(backend, run["_image_after"]),
+        },
+        "ideal": image_sharpness(backend, sc.image),
+    }
 
 
 def experiment_method_summary(seeds: tuple[int, ...] = (20250915, 7)) -> list[dict]:
