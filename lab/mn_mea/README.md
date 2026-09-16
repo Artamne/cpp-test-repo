@@ -146,17 +146,25 @@ stage_a  ←  stage_b, stage_d
 Два шага, и в каждом данные выбираются по-своему.
 
 **Шаг 1, подготовка среза.** Делается скриптом `bench/prepare_slice.py` на
-машине, где лежит запись. Он привязан к формату конкретного `.mat`, поэтому
-файл в нём выбирается **правкой трёх строк сверху** — аргументов командной
-строки скрипт не принимает:
+машине, где лежит запись. Каталог с данными — **первым аргументом**, а если
+его не дать, берётся `DATA_DIR` из начала файла (строка 57):
+
+```
+python bench\prepare_slice.py E:\Work\__Galogram__\cluade\RSA_MAX
+python bench\prepare_slice.py                              # то же, из DATA_DIR
+```
 
 ```python
-DATA_DIR = r"E:\Work\__Galogram__\cluade\RSA_MAX"
-RCMC_NAME = "SAR_RCMC_Result.mat"
+DATA_DIR = r"E:\Work\__Galogram__\cluade\RSA_MAX"   # каталог
+RCMC_NAME = "SAR_RCMC_Result.mat"                    # имена внутри него
 PARAMS_NAME = "SAR_RDA_Params.mat"
 ```
 
-Кладёт результат в `DATA_DIR\mn_mea_srez`: `h_srez.npy`, `meta.json`,
+Имена самих `.mat` меняются только правкой файла: скрипт привязан к их
+формату, и подменять их походя незачем. Если в каталоге их нет, скрипт
+скажет это прямо и остановится, не читая гигабайты.
+
+Кладёт результат в `<каталог>\mn_mea_srez`: `h_srez.npy`, `meta.json`,
 `srez.png`. Нужны `h5py` и `scipy` — в `requirements.txt` их нет, это
 зависимости подготовки, а не алгоритма.
 

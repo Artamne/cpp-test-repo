@@ -3,7 +3,8 @@
 
 Запускать на машине, где лежат данные:
 
-    python prepare_slice.py
+    python bench/prepare_slice.py                 # путь из DATA_DIR ниже
+    python bench/prepare_slice.py E:\путь\к\данным  # или аргументом
 
 Ничего не спрашивает, ничего не перезаписывает во входных файлах. Кладёт рядом
 папку mn_mea_srez/ с тремя файлами:
@@ -51,11 +52,15 @@ import numpy as np
 
 # ---------------------------------------------------------------- настройки
 
-#: Где лежат входные файлы. Одна строка — чтобы поменять было одно место.
+#: Где лежат входные файлы. Значение по умолчанию; первым аргументом
+#: командной строки перебивается, менять файл ради другого каталога не нужно.
 DATA_DIR = r"E:\Work\__Galogram__\cluade\RSA_MAX"
 RCMC_NAME = "SAR_RCMC_Result.mat"
 PARAMS_NAME = "SAR_RDA_Params.mat"
-OUT_DIR = os.path.join(DATA_DIR, "mn_mea_srez")
+
+#: Куда кладётся срез: подкаталог рядом с данными. Имя одно и то же всегда —
+#: run_real.py ждёт именно его.
+OUT_NAME = "mn_mea_srez"
 
 #: Половина ширины окна по дальности, в долях R_B0.
 #: Geometry в MN-MEA ОДНА на всю сцену, а время апертуры T_a пропорционально
@@ -381,9 +386,18 @@ def build_passport(params: dict, win: dict, r_b: float, y_m_over_R: float) -> di
 
 
 def main() -> None:
-    os.makedirs(OUT_DIR, exist_ok=True)
+    data_dir = sys.argv[1] if len(sys.argv) > 1 else DATA_DIR
+    out_dir = os.path.join(data_dir, OUT_NAME)
+    print(f"данные: {data_dir}")
+    missing = [n for n in (RCMC_NAME, PARAMS_NAME)
+               if not os.path.isfile(os.path.join(data_dir, n))]
+    if missing:
+        sys.exit(f"в этом каталоге нет: {', '.join(missing)}\n"
+                 f"поправьте DATA_DIR в начале файла или дайте путь аргументом")
+    os.makedirs(out_dir, exist_ok=True)
+
     print("паспорт радара")
-    params = read_params(os.path.join(DATA_DIR, PARAMS_NAME))
+    params = read_params(os.path.join(data_dir, PARAMS_NAME))
     R_vec = params["R_vec"]
     r_b = float(np.mean(np.diff(R_vec)))
     lambda_ = 299_792_458.0 / params["f_0"]
@@ -399,7 +413,7 @@ def main() -> None:
         return params["gamma_win"] * lambda_ * R / (2.0 * params["resolution"] * v)
 
     print("\nоткрываем запись")
-    f, dset, name = open_rcmc(os.path.join(DATA_DIR, RCMC_NAME))
+    f, dset, name = open_rcmc(os.path.join(data_dir, RCMC_NAME))
     range_axis = 0 if dset.shape[0] == R_vec.size else 1
     n_az = dset.shape[1 - range_axis]
     print(f"  массив '{name}' {dset.shape}, ось дальности {range_axis}, "
@@ -460,7 +474,7 @@ def main() -> None:
     print(f"  сверка fft(h) == g: {check:.3e} при масштабе {scale:.3e} "
           f"({check / scale:.2e} относительно)")
 
-    np.save(os.path.join(OUT_DIR, "h_srez.npy"), h)
+    np.save(os.path.join(out_dir, "h_srez.npy"), h)
 
     passport = build_passport(params, win, r_b, y_m_over_R=0.9)
     meta = {
@@ -520,7 +534,7 @@ def main() -> None:
             "N_k_ozhidaemoe": 1,
         },
     }
-    with open(os.path.join(OUT_DIR, "meta.json"), "w", encoding="utf-8") as fp:
+    with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as fp:
         json.dump(meta, fp, ensure_ascii=False, indent=2)
 
     try:
@@ -539,12 +553,12 @@ def main() -> None:
         plt.title(f"окно среза, R_B0 = {win['R_B0']:.0f} м, "
                   f"нормированная энтропия {S_best:.3f}")
         plt.tight_layout()
-        plt.savefig(os.path.join(OUT_DIR, "srez.png"), dpi=110)
+        plt.savefig(os.path.join(out_dir, "srez.png"), dpi=110)
         print(f"  картинка записана")
     except ImportError:
         print("  matplotlib нет, картинку пропустили")
 
-    print(f"\nготово: {OUT_DIR}")
+    print(f"\nготово: {out_dir}")
     print("  h_srez.npy   вход этапа A")
     print("  meta.json    паспорт")
     print("  srez.png     на что смотреть глазами")
