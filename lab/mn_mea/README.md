@@ -18,6 +18,30 @@ python3 run.py            # всё: опыты, графики в ./out, отч�
 python3 run.py /путь/куда # то же, в другой каталог
 ```
 
+**Пока возитесь — пишите в СВОЙ каталог, не в `./out`.** Содержимое `./out`
+лежит в репозитории: это отчёт и графики того прогона, что соответствует
+коду. Запуск без аргумента их перезаписывает, и `git pull` потом отказывает —
+
+```
+error: Your local changes to the following files would be overwritten by merge:
+    lab/mn_mea/out/report.md
+```
+
+Поэтому:
+
+```
+python3 run.py ~/mnmea-out          # Linux
+python run.py E:\temp\mnmea-out     # Windows
+```
+
+А если уже перезаписали и `pull` встал — выбросить своё и потянуть заново
+(файлы генерируемые, терять нечего):
+
+```
+git checkout -- lab/mn_mea/out/
+git pull origin claude/determined-clarke-e3hdlk
+```
+
 Нужны `numpy` и `matplotlib`, они перечислены в `requirements.txt`:
 
 ```
