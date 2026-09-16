@@ -345,9 +345,7 @@ def iterate_block(
     из одних единиц (§10.6, §10.7 задания).
     """
     h = backend.asarray(h)
-    phi = backend.asarray(np.asarray(phi_initial, dtype=np.float64)).astype(
-        backend.real_dtype, copy=False
-    )
+    phi = backend.asarray(phi_initial)  # хоть numpy, хоть уже на устройстве
     phi_initial_out = backend.to_numpy(phi).copy()
 
     M, N = h.shape

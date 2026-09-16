@@ -73,14 +73,31 @@ class Backend:
 
     def asarray(self, a) -> "object":
         """Кладёт массив на устройство бэкенда и приводит к его точности.
-        Комплексный вход -> complex_dtype, вещественный -> real_dtype."""
+        Комплексный вход -> complex_dtype, вещественный -> real_dtype.
+
+        Массив, УЖЕ лежащий на устройстве, через numpy не прогоняется. На
+        видеокарте это не оптимизация, а единственный рабочий путь: cupy
+        запрещает неявное превращение в numpy-массив и на np.asarray(a)
+        отвечает отказом. Меняется только точность, и без копии, если она
+        и так нужная.
+        """
+        if isinstance(a, self.xp.ndarray):
+            dtype = self.complex_dtype if a.dtype.kind == "c" else self.real_dtype
+            return a.astype(dtype, copy=False)
         a = np.asarray(a)
         dtype = self.complex_dtype if np.iscomplexobj(a) else self.real_dtype
         return self.xp.asarray(a, dtype=dtype)
 
     def to_numpy(self, a) -> np.ndarray:
-        """Возвращает массив в numpy на процессоре — для печати и графиков."""
-        return np.asarray(a.get() if self.on_gpu else a)
+        """Возвращает массив в numpy на процессоре — для печати и графиков.
+
+        Снятие с устройства делается только для того, что на устройстве и
+        лежит: на видеокарте сюда может прийти и обычный numpy-массив, а у
+        него метода .get() нет.
+        """
+        if self.on_gpu and isinstance(a, self.xp.ndarray):
+            a = a.get()
+        return np.asarray(a)
 
     def fft_kernel_minus(self, a):
         """(5-3): g(m,n) = sum_k a(k,n) e^{-j2*pi*k*m/M}, множитель alpha.

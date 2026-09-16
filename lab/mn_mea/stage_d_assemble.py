@@ -29,7 +29,7 @@ def block_image(backend: Backend, h_block, phi_hat):
     стоимость итерации (§10.6) оно не входит.
     """
     h_block = backend.asarray(h_block)
-    phi = backend.asarray(np.asarray(phi_hat, dtype=np.float64))
+    phi = backend.asarray(phi_hat)  # хоть numpy, хоть уже на устройстве
     return backend.fft_kernel_minus(h_block * backend.xp.exp(1j * phi)[:, None])
 
 
