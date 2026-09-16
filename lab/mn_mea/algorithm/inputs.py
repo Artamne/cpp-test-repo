@@ -7,6 +7,7 @@
 
 Порядок функций — порядок применения:
 
+    aperture_plan       сколько кадров выйдет из записи и какое M в каждом
     check_data          h(k,n): форма, тип, конечность, раскладка по k
     check_geometry      Geometry: единицы, знаки, согласованность
     derived_numbers     что из них получится: PRF, размер сцены, число блоков
@@ -40,6 +41,65 @@ MIN_AZIMUTH_BINS = 16
 #: подтверждённой. Не строгий критерий, а предупреждение: у сцены,
 #: занимающей всю полосу, обе половины равны, и проверка промолчит.
 BAND_CENTRE_RATIO = 2.0
+
+
+def aperture_plan(
+    wavelength_m: float,
+    range_near_m: float,
+    range_far_m: float,
+    speed_ms: float,
+    prf_hz: float,
+    azimuth_resolution_m: float,
+    record_seconds: float,
+    overlap: float = 0.0,
+) -> dict[str, float]:
+    """План нарезки записи на апертуры — ДО всякого автофокуса.
+
+    Принимает длину волны, ближнюю и дальнюю границы полосы дальностей,
+    путевую скорость, частоту повторения, нужное разрешение по азимуту,
+    длительность записи и перекрытие апертур (0 — встык, 0,5 — половинное);
+    возвращает словарь чисел.
+
+    Зачем это здесь. Запись длиной в секунды — НЕ одна апертура. Апертура
+    задаётся нужным разрешением:
+
+        T_a = lambda * R / (2 * v * r_a)
+
+    и растёт с дальностью, потому что скорость изменения доплера
+    K_a = 2 v^2 / (lambda R) с дальностью падает. Полоса доплера при этом от
+    дальности НЕ зависит вовсе: B_a = v / r_a.
+
+    Отсюда правило: T_a берётся по ДАЛЬНЕЙ кромке. Тогда число импульсов
+    M = PRF * T_a одно для всех стробов, и массив h выходит прямоугольным —
+    а другого алгоритм не принимает. Ценой будет переразрешение ближней
+    кромки ровно в range_far / range_near раз: там апертура длиннее, чем
+    нужно. Это не ошибка; хотите ровное разрешение по полосе — отфильтруйте
+    ближние стробы до той же полосы доплера, но помните, что опустевшие бины
+    дадут E'' = 0 и фаза в них не определится.
+
+    Возвращаются и границы разумной сетки блоков: замером (см. README,
+    «Если ИНС нет») плато лежит на блоках в 16-32 отсчёта по азимуту.
+    """
+    if not (0.0 <= overlap < 1.0):
+        raise ValueError(f"перекрытие должно быть в [0, 1), а не {overlap!r}")
+
+    aperture_s = wavelength_m * range_far_m / (2.0 * speed_ms * azimuth_resolution_m)
+    pulses = int(math.ceil(prf_hz * aperture_s))
+    step_s = aperture_s * (1.0 - overlap)
+    frames = int(math.floor((record_seconds - aperture_s) / step_s)) + 1 if record_seconds >= aperture_s else 0
+
+    return {
+        "aperture_seconds": aperture_s,
+        "aperture_length_m": speed_ms * aperture_s,
+        "pulses_per_aperture": pulses,
+        "doppler_bandwidth_hz": speed_ms / azimuth_resolution_m,
+        "frames_in_record": frames,
+        "frame_step_seconds": step_s,
+        "near_edge_resolution_m": wavelength_m * range_near_m / (2.0 * speed_ms * aperture_s),
+        "near_edge_oversampling": range_far_m / range_near_m,
+        "blocks_azimuth_min": int(math.ceil(pulses / 32)),
+        "blocks_azimuth_max": int(math.ceil(pulses / 16)),
+    }
 
 
 def check_data(h) -> list[str]:
