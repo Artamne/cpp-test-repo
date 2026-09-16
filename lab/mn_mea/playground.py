@@ -34,6 +34,17 @@ from backend import get_backend
 LOOK = pathlib.Path(__file__).parent / "look"
 
 
+def в_numpy(массив):
+    """Снять массив с устройства, если он там лежит.
+
+    Рисовать и печатать умеет только numpy на процессоре, а на видеокарте
+    np.asarray(массив) запрещён — cupy отвечает отказом и требует явного
+    .get(). Снятие делает backend.to_numpy, и делается оно ЗДЕСЬ, в одном
+    месте, а не по всем помощникам вразнобой.
+    """
+    return backend.to_numpy(массив)
+
+
 def показать(массив, подпись: str, столбец: int = 0) -> pathlib.Path:
     """Нарисовать срез массива по азимуту и сохранить в файл.
 
@@ -41,7 +52,7 @@ def показать(массив, подпись: str, столбец: int = 0)
     возвращает путь к сохранённому файлу и печатает его.
     """
     LOOK.mkdir(exist_ok=True)
-    данные = np.asarray(массив)
+    данные = в_numpy(массив)
     срез = данные if данные.ndim == 1 else данные[:, столбец]
 
     fig, ax = plt.subplots(figsize=(9, 4))
@@ -68,7 +79,7 @@ def карта(массив, подпись: str) -> pathlib.Path:
     """Нарисовать весь массив (M, N) как картинку в децибелах.
     Принимает массив и подпись; возвращает путь к файлу."""
     LOOK.mkdir(exist_ok=True)
-    мощность = np.abs(np.asarray(массив)) ** 2
+    мощность = np.abs(в_numpy(массив)) ** 2
     дб = 10 * np.log10(np.maximum(мощность, мощность.max() * 1e-6) / мощность.max())
 
     fig, ax = plt.subplots(figsize=(7, 6))
@@ -89,7 +100,7 @@ def карта(массив, подпись: str) -> pathlib.Path:
 def глянуть(имя: str, массив) -> None:
     """Напечатать про массив всё существенное: форму, тип, размах.
     Принимает имя и массив; ничего не возвращает."""
-    a = np.asarray(массив)
+    a = в_numpy(массив)
     if np.iscomplexobj(a):
         print(f"   {имя:8s} {str(a.shape):10s} {str(a.dtype):12s} "
               f"|min|={np.abs(a).min():.4e}  |max|={np.abs(a).max():.4e}")
@@ -162,7 +173,7 @@ print(f"   criterion = {C.stop_criterion(backend, phi_new, phi):.4e}")
 print("\n>>> точка останова: смотрите переменные h, g, P, W, E_1, E_2, phi_new")
 print(">>> в Debug Console можно писать что угодно, например:")
 print(">>>     показать(backend.to_numpy(g), 'моя картинка')")
-print(">>>     np.abs(g).max()")
+print(">>>     np.abs(backend.to_numpy(g)).max()   # с карты сначала снять")
 breakpoint()
 
 # --------------------------------------------- а теперь то же самое до конца
