@@ -151,15 +151,18 @@ def plot_image_before_after(
 def plot_azimuth_cut(case: dict, path: pathlib.Path) -> pathlib.Path:
     """График 5 §8: срез через точечную цель по азимуту, до и после, в дБ."""
     column, row = case["_cut_col"], case["_cut_row"]
-    before = np.abs(case["_image_before"][:, column]) ** 2
-    after = np.abs(case["_image_after"][:, column]) ** 2
+    # срез восстанавливается между отсчётами: отклик занимает около 1,25
+    # отсчёта, и по сырой сетке синка просто не видно, см. validate.interpolated_cut
+    factor = V.AZIMUTH_OVERSAMPLE
+    before = np.abs(V.interpolated_cut(case["_image_before"][:, column], factor)) ** 2
+    after = np.abs(V.interpolated_cut(case["_image_after"][:, column], factor)) ** 2
     reference = after.max()
     to_db = lambda x: 10 * np.log10(np.maximum(x, reference * 1e-9) / reference)
 
     M = before.size
-    shifted = np.arange(M) - row
-    order = np.argsort(((shifted + M // 2) % M) - M // 2)
-    axis = ((shifted + M // 2) % M) - M // 2
+    shifted = np.arange(M) / factor - row
+    order = np.argsort(((shifted + M // (2 * factor)) % (M / factor)) - M / (2 * factor))
+    axis = ((shifted + M // (2 * factor)) % (M / factor)) - M / (2 * factor)
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
     ax.plot(axis[order], to_db(before)[order], linewidth=1.4, label="до")
