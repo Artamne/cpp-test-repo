@@ -1,0 +1,32 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "MN-MEA: полный прогон run.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/lab/mn_mea/run.py",
+            "cwd": "${workspaceFolder}/lab/mn_mea",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "MN-MEA: песочница playground.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/lab/mn_mea/playground.py",
+            "cwd": "${workspaceFolder}/lab/mn_mea",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "MN-MEA: текущий открытый файл",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "cwd": "${fileDirname}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}
