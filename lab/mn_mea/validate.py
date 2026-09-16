@@ -28,6 +28,7 @@
     experiment_block_transform       §5           длина (5-3): блок или сцена
     experiment_image_shift           решение №5   снятие сдвига блока
     experiment_block_window          решение №6   перехлёст окна и нули
+    experiment_method_summary                     сводка: что дал каждый способ
     experiment_full_run              §10.4        A->B->C->D целиком
 """
 
@@ -827,6 +828,7 @@ def experiment_block_criterion() -> dict:
 def experiment_full_run(
     M: int = 256, N: int = 96, seed: int = 20250915, eta_offset: bool = True,
     scene_transform: bool = False, deshift: bool = True,
+    step_max: float = C.STEP_MAX_RAD,
 ) -> dict:
     """§10.4 задания: полный прогон A->B->C->D на синтетике.
 
@@ -845,6 +847,10 @@ def experiment_full_run(
 
     deshift=False отключает решение реализации №5 (снятие сдвига блока перед
     укладкой) — снова ЗАМЕР его цены, см. experiment_image_shift.
+
+    step_max задаёт предел шага (5-8), решение реализации №2. Нужен, чтобы
+    сводная таблица способов могла показать и прежнее, неверное значение pi;
+    см. experiment_method_summary.
     """
     geom = DEMO_GEOMETRY
     backend = get_backend("auto")
@@ -900,7 +906,8 @@ def experiment_full_run(
             eta += (q - block.q_k) / 2.0
         phi_0 = B.initial_phase(eta, eps_reference)
 
-        result = C.iterate_block(backend, h_block, phi_0, mu=MU_MEASURED)
+        result = C.iterate_block(backend, h_block, phi_0, mu=MU_MEASURED,
+                                 step_max=step_max)
         # решение реализации №5: линейную часть выбираем так, чтобы блок встал
         # на своё место на сцене; энтропии это не меняет — сдвиг целый.
         phi_final = (D.remove_image_shift(backend, result.phi) if deshift
@@ -1023,6 +1030,70 @@ def experiment_image_shift(
             "mean_shift_no_points": float(np.mean(without_points)),
             "mean_entropy": entropy_shift,
         }
+    return rows
+
+
+def experiment_method_summary(seeds: tuple[int, ...] = (20250915, 7)) -> list[dict]:
+    """Сводка: что дал каждый способ, одним кодом на одних сценах.
+
+    Каждая строка добавляет ОДНО изменение к предыдущей, поэтому виден вклад
+    именно этого изменения, а не сумма всего сразу. Отдельно снизу — сценное
+    преобразование вместо блочного, как ветка в сторону, а не ступень.
+
+    Верхняя строка — вообще без автофокуса, phi = 0: нижняя граница, с
+    которой всё начинается. Нижняя — идеальная сцена без внесённой ошибки:
+    потолок, выше которого не бывает. Колонки «сошлось», «остаток» и «сдвиг»
+    для строки без автофокуса пусты: они описывают поиск фазы, а его там нет.
+
+    Мера — собранная сцена целиком (image_sharpness), плюс средний остаток
+    фазы по блокам и средний модуль сдвига по блокам с точечными целями.
+    """
+    rows: list[dict] = []
+    saved = (A.BLOCK_OVERLAP_FRACTION, A.BLOCK_ZERO_PAD_FRACTION)
+    ladder = (
+        ("без автофокуса, phi = 0",       0.0, 0.0, False, math.pi, False, True),
+        ("книга буквально",               0.0, 0.0, False, math.pi, False, False),
+        ("+ предел шага 1 рад (№2)",      0.0, 0.0, False, 1.0,     False, False),
+        ("+ снятие сдвига (№5)",          0.0, 0.0, True,  1.0,     False, False),
+        ("+ нули 0,5 (№6)",               0.0, 0.5, True,  1.0,     False, False),
+        ("+ перехлёст 0,5 (№6)",          0.5, 0.5, True,  1.0,     False, False),
+        ("сценное ПФ вместо блочного",    0.0, 0.0, True,  1.0,     True,  False),
+    )
+    backend = get_backend("auto")
+    try:
+        for label, overlap, zeros, deshift, step_max, scene, unfocused in ladder:
+            A.BLOCK_OVERLAP_FRACTION, A.BLOCK_ZERO_PAD_FRACTION = overlap, zeros
+            runs = [experiment_full_run(seed=seed, deshift=deshift, step_max=step_max,
+                                        scene_transform=scene) for seed in seeds]
+            sharp = [image_sharpness(
+                backend, r["_image_before" if unfocused else "_image_after"]) for r in runs]
+            with_points = [
+                float(np.mean([abs(b["azimuth_shift"]) for b in r["per_block"] if b["n_points"]]))
+                for r in runs
+            ]
+            rows.append({
+                "method": label,
+                "unfocused": unfocused,
+                "is_current": (overlap, zeros) == saved and deshift and not scene
+                              and step_max == C.STEP_MAX_RAD,
+                "converged_blocks": None if unfocused else float(
+                    np.mean([r["converged_blocks"] for r in runs])),
+                "mean_residual_rms_rad": None if unfocused else float(
+                    np.mean([r["mean_residual_rms_rad"] for r in runs])),
+                "mean_shift": None if unfocused else float(np.mean(with_points)),
+                "S": float(np.mean([m["S"] for m in sharp])),
+                "contrast": float(np.mean([m["contrast"] for m in sharp])),
+                "peak": float(np.mean([m["peak"] for m in sharp])),
+            })
+    finally:
+        A.BLOCK_OVERLAP_FRACTION, A.BLOCK_ZERO_PAD_FRACTION = saved
+
+    ideal = image_sharpness(backend, experiment_full_run(seed=seeds[0])["_scene"].image)
+    rows.append({
+        "method": "идеальная сцена — потолок", "unfocused": True, "is_current": False,
+        "converged_blocks": None, "mean_residual_rms_rad": None, "mean_shift": None,
+        **{k: ideal[k] for k in ("S", "contrast", "peak")},
+    })
     return rows
 
 
