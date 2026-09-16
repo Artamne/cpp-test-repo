@@ -221,9 +221,9 @@ def main(out_dir: pathlib.Path) -> int:
     say("| предел шага, рад | сошлось блоков | итераций (ср.) | остаток (ср.), рад | критерий = 2, раз |")
     say("|---:|---|---:|---:|---:|")
     for row in V.experiment_step_limit():
-        имя = "pi (прежнее, НЕВЕРНОЕ)" if row["is_pi"] else f"{row['step_max_rad']:g}"
-        взято = " ← взято" if row["step_max_rad"] == C.STEP_MAX_RAD else ""
-        say(f"| {имя}{взято} | {row['converged_blocks']}/{row['blocks']} | "
+        step_label = "pi (прежнее, НЕВЕРНОЕ)" if row["is_pi"] else f"{row['step_max_rad']:g}"
+        mark = " ← взято" if row["step_max_rad"] == C.STEP_MAX_RAD else ""
+        say(f"| {step_label}{mark} | {row['converged_blocks']}/{row['blocks']} | "
             f"{row['mean_iterations']:.1f} | {row['mean_residual_rms_rad']:.4f} | "
             f"{row['criterion_pinned_at_two']} |")
     say()
@@ -324,8 +324,8 @@ def main(out_dir: pathlib.Path) -> int:
     say("| способ | длина (5-3) | сошлось | остаток, рад | S (5-6) | контраст | пик | энергии вне блока |")
     say("|---|---|---|---:|---:|---:|---:|---:|")
     for label, row in V.experiment_block_transform().items():
-        сош = "—" if row["converged_blocks"] is None else f"{row['converged_blocks']}/12"
-        say(f"| {label} | {row['transform_length']} | {сош} | "
+        converged_cell = "—" if row["converged_blocks"] is None else f"{row['converged_blocks']}/12"
+        say(f"| {label} | {row['transform_length']} | {converged_cell} | "
             f"{row['mean_residual_rms_rad']:.4f} | {row['S']:.4f} | "
             f"{row['contrast']:.2f} | {row['peak']:.1f} | {row['leak_percent']:.1f} % |")
     say()

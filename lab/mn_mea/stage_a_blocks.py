@@ -327,8 +327,8 @@ def block_data(backend, g_scene, block: Block):
     см. validate.experiment_block_transform и README, «Как читается нарезка
     на блоки».
     """
-    плитка = g_scene[block.m_start : block.m_stop, block.n_start : block.n_stop]
-    return backend.xp.fft.ifft(плитка, axis=0) / backend.alpha
+    tile = g_scene[block.m_start : block.m_stop, block.n_start : block.n_stop]
+    return backend.xp.fft.ifft(tile, axis=0) / backend.alpha
 
 
 def centre_block_index(M_k: int, N_k: int) -> int:

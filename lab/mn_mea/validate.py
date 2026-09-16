@@ -847,11 +847,11 @@ def experiment_full_run(
     images_before: dict[int, object] = {}
     for block in blocks:
         if scene_transform:  # замер другого прочтения, см. experiment_block_transform
-            окно = backend.xp.zeros_like(g_scene)
-            окно[block.m_start : block.m_stop, block.n_start : block.n_stop] = g_scene[
+            window = backend.xp.zeros_like(g_scene)
+            window[block.m_start : block.m_stop, block.n_start : block.n_stop] = g_scene[
                 block.m_start : block.m_stop, block.n_start : block.n_stop
             ]
-            h_block = (backend.xp.fft.ifft(окно, axis=0) / backend.alpha)[
+            h_block = (backend.xp.fft.ifft(window, axis=0) / backend.alpha)[
                 :, block.n_start : block.n_stop
             ]
             M_block = M
@@ -873,18 +873,18 @@ def experiment_full_run(
         phi_0 = B.initial_phase(eta, eps_reference)
 
         result = C.iterate_block(backend, h_block, phi_0, mu=MU_MEASURED)
-        плитка = D.block_image(backend, h_block, result.phi)
-        плитка0 = D.block_image(backend, h_block, np.zeros(M_block))
+        tile = D.block_image(backend, h_block, result.phi)
+        tile_zero = D.block_image(backend, h_block, np.zeros(M_block))
         leak = 0.0  # у блочного (5-3) энергии некуда деться: свёртка круговая
         if scene_transform:  # изображение вышло во всю сцену, берётся полоса блока
-            мощность = np.abs(backend.to_numpy(плитка)) ** 2
+            power = np.abs(backend.to_numpy(tile)) ** 2
             leak = 1.0 - float(
-                мощность[block.m_start : block.m_stop].sum() / мощность.sum()
+                power[block.m_start : block.m_stop].sum() / power.sum()
             )
-            плитка = плитка[block.m_start : block.m_stop]
-            плитка0 = плитка0[block.m_start : block.m_stop]
-        images[block.q_k] = плитка
-        images_before[block.q_k] = плитка0
+            tile = tile[block.m_start : block.m_stop]
+            tile_zero = tile_zero[block.m_start : block.m_stop]
+        images[block.q_k] = tile
+        images_before[block.q_k] = tile_zero
 
         truth_block = truth_on_block_grid(phi_err, M_block)
         per_block.append({
@@ -972,10 +972,10 @@ def experiment_block_transform() -> dict:
     """
     backend = get_backend("auto")
     rows: dict[str, dict] = {}
-    эталон = None
+    ideal_scene = None
     for label, flag in (("блочное ПФ (как в §5)", False), ("сценное ПФ", True)):
         run = experiment_full_run(scene_transform=flag)
-        эталон = run["_scene"].image
+        ideal_scene = run["_scene"].image
         rows[label] = {
             "transform_length": "M сцены" if flag else "m_b блока",
             "converged_blocks": run["converged_blocks"],
@@ -988,7 +988,7 @@ def experiment_block_transform() -> dict:
     rows["идеальная сцена"] = {
         "transform_length": "—", "converged_blocks": None,
         "mean_residual_rms_rad": 0.0, "leak_percent": 0.0,
-        **image_sharpness(backend, эталон),
+        **image_sharpness(backend, ideal_scene),
     }
     return rows
 
