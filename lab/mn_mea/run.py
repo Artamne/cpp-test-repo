@@ -16,6 +16,7 @@ import pathlib
 import sys
 
 import plots
+import backend as B_
 import stage_c_iterate as C
 import validate as V
 
@@ -149,6 +150,10 @@ def main(out_dir: pathlib.Path) -> int:
     # ---------------------------------------------------------------- §10.5
     say("## 6. Сверка двух бэкендов (§3, §10.5)")
     say()
+    годна, причина = B_.gpu_status()
+    if not годна:
+        say(f"Видеокарта не используется: {причина}.")
+        say()
     backends = V.experiment_backends()
     say(f"Доступные пути счёта: {', '.join(backends['available'])}. "
         f"Видеокарта на этой машине: **{'есть' if backends['gpu_present'] else 'НЕТ'}**.")

@@ -134,16 +134,42 @@ class Backend:
         return self.xp.sum(a, axis=axis, dtype=self.accum_complex)
 
 
+def gpu_status() -> tuple[bool, str]:
+    """Есть ли на машине РАБОЧАЯ видеокарта и, если нет, почему.
+
+    Возвращает (годится, причина словами).
+
+    Мало проверить, что cupy импортируется. Импорт может пройти, а первое же
+    ядро — не собраться: у сборки cupy и установленного CUDA Toolkit разные
+    наборы заголовков, и NVRTC отказывает уже посреди работы. Поэтому здесь
+    считается крошечное БПФ со сравнением — ровно то, на чём стоит (5-3) и
+    ровно та связка, на которой отказ и вылезает.
+    """
+    try:
+        xp = importlib.import_module("cupy")
+    except Exception as exc:
+        return False, f"cupy не установлен или не импортируется: {type(exc).__name__}"
+    try:
+        out = xp.abs(xp.fft.fft(xp.arange(4, dtype=xp.complex128)))
+        bool(xp.all(out >= 0))
+    except Exception as exc:
+        первая = str(exc).strip().splitlines()[0][:160] if str(exc).strip() else ""
+        return False, (f"cupy импортируется, но не считает — {type(exc).__name__}"
+                       + (f": {первая}" if первая else ""))
+    return True, "видеокарта считает"
+
+
 def available_backends() -> list[str]:
     """Какие пути счёта есть на этой машине. Первым — предпочтительный.
     Нужен для §3: сверка двух бэкендов обязательна, а какие именно доступны,
-    решается здесь и нигде больше."""
+    решается здесь и нигде больше.
+
+    Видеокарта попадает в список, только если она ПРОВЕРЕНА счётом, см.
+    gpu_status. Иначе 'auto' выбрал бы путь, который развалится на первом же
+    ядре, и отказ пришёл бы не там, где его причина.
+    """
     names = []
-    try:
-        importlib.import_module("cupy")  # проверка доступности, не использование
-    except Exception:
-        pass
-    else:
+    if gpu_status()[0]:
         names += ["cupy", "cupy32"]
     names += ["numpy", "numpy32"]
     return names
