@@ -29,6 +29,7 @@
     experiment_image_shift           решение №5   снятие сдвига блока
     experiment_block_window          решение №6   перехлёст окна и нули
     experiment_space_invariance                   чего НЕ проверяет неизменчивый стенд
+    experiment_azimuth_window        решение №7   весовое окно по азимуту
     experiment_space_variant_run     §3           A->B->C->D на ИЗМЕНЧИВОЙ ошибке
     experiment_method_summary                     сводка: что дал каждый способ
     experiment_full_run              §10.4        A->B->C->D целиком
@@ -258,21 +259,28 @@ def interpolated_cut(cut: np.ndarray, factor: int = AZIMUTH_OVERSAMPLE) -> np.nd
     Срез возвращается в область дальность-доплер, полученные M отсчётов
     дополняются нулями до M * factor, и (5-3) берётся этой длины:
 
-        g'(m') = sum_k h(k) e^{-j 2 pi k m' / (M factor)} = g(m' / factor)
+        g'(m') = sum_k h(k) e^{-j 2 pi k~ m' / (M factor)} = g(m' / factor)
 
     то есть ровно та же сумма, но сетка изображения гуще в factor раз.
 
-    ПРОВЕРЕНО двумя числами: пик встаёт в 40,312 при цели в 40,300 (шаг
-    сетки 1/16 = 0,0625), и первый боковой лепесток выходит -13,28 дБ при
-    теоретических для прямоугольной апертуры -13,3.
+    НОМЕР БИНА БЕРЁТСЯ ЦЕНТРИРОВАННЫМ, k~ = -M/2 … M/2-1, а не натуральным
+    0 … M-1 — по той же причине, что и в centred_bin_index: ядро (5-3)
+    периодично по k, и на ДРОБНОЙ сетке m представитель k и представитель
+    k-M дают РАЗНОЕ. На целой сетке они совпадают, поэтому ошибка и не
+    видна, пока не начнёшь восстанавливать между отсчётами.
 
-    ОСТОРОЖНО, здесь есть неразобранное. На ВЗВЕШЕННЫХ данных (окно этапа D,
-    решение №7) это же дополнение даёт первый боковой -4,3 дБ вместо
-    табличных -42,7 для Хэмминга. Дополнение нулями МЕЖДУ половинами массива
-    даёт для окон табличные значения, но уводит пик с места. То есть ни один
-    из двух способов пока не верен сразу и для положения, и для уровней, и
-    замер уровней боковых лепестков взвешенных окон доверия не заслуживает.
-    См. README, «Чего в этой работе НЕТ».
+    Отсюда и раскладка: бины с k~ >= 0 кладутся в начало, бины с k~ < 0 — в
+    конец длинного массива, а нули приходятся на середину. Дописать нули
+    просто в конец — значит объявить частоты бинов натуральными, и тогда
+    отклик взвешенного окна разваливается: у Хэмминга выходит -4,3 дБ вместо
+    -42,7, потому что окно после ifftshift имеет максимум на обоих концах
+    записи и такой «хвост» режется ровно по максимуму.
+
+    ПРОВЕРЕНО против прямой суммы по определению, без БПФ. Пик стоит в 40,312
+    при цели 40,300 (шаг сетки 1/16) и НЕ ДВИГАЕТСЯ ни при каком окне —
+    двигаться он и не должен, окно только расширяет главный лепесток. Уровни
+    первого бокового: -13,28 без окна, -31,50 Хэннинг, -42,67 Хэмминг,
+    -43,79 Кайзер beta=6, при табличных -13,3 / -31,5 / -42,7 / -44.
 
     Проверяемо: в точках исходной сетки восстановленный срез обязан совпасть
     с исходным. Это проверяется замером в experiment_point_response.
@@ -284,7 +292,9 @@ def interpolated_cut(cut: np.ndarray, factor: int = AZIMUTH_OVERSAMPLE) -> np.nd
     # получается зеркальной и восстановленный отклик уезжает с места.
     data = np.fft.ifft(cut)                  # обратно в дальность-доплер
     padded = np.zeros(M * factor, dtype=np.complex128)
-    padded[:M] = data                        # та же сумма, сетка изображения гуще
+    half = M // 2
+    padded[:half] = data[:half]              # бины с k~ >= 0 — в начало
+    padded[M * factor - (M - half):] = data[half:]   # бины с k~ < 0 — в КОНЕЦ
     return np.fft.fft(padded)
 
 
@@ -1099,6 +1109,61 @@ def _pairwise_spread(truths: list[np.ndarray]) -> float:
         float(np.sqrt(np.mean((a - b) ** 2)))
         for i, a in enumerate(cleaned) for b in cleaned[i + 1:]
     )
+
+
+def experiment_azimuth_window(M: int = 256, target: float = 40.3) -> list[dict]:
+    """Решение реализации №7: весовое окно по азимуту в этапе D.
+
+    Считается отклик на ОДНУ точечную цель, поставленную в дробное место
+    target, для каждого окна из stage_d_assemble.AZIMUTH_WINDOWS. Меряются
+    три числа: положение пика, уровень первого бокового лепестка и ширина
+    главного по -3 дБ, все по восстановленному срезу (interpolated_cut).
+
+    Положение пика тут не украшение, а ПРОВЕРКА: окно обязано расширять
+    главный лепесток и НЕ ДВИГАТЬ пик. Если пик поехал, значит сломан замер,
+    а не окно, — так и было, пока восстановление шло по натуральному номеру
+    бина вместо центрированного.
+
+    Уровни сверяются с табличными для этих окон: -13,3 / -31,5 / -42,7 / -44.
+    """
+    backend = get_backend("auto")
+    k_centred = centred_bin_index(M)
+    h = backend.asarray((np.exp(2j * np.pi * k_centred * target / M) / M)[:, None])
+    factor = AZIMUTH_OVERSAMPLE
+    reference_peak = None
+    rows = []
+    for name in D.AZIMUTH_WINDOWS:
+        image = backend.to_numpy(
+            D.block_image(backend, D.azimuth_window(backend, h, name), np.zeros(M))
+        )[:, 0]
+        power = np.abs(interpolated_cut(image, factor)) ** 2
+        peak = float(power.max())
+        reference_peak = reference_peak if reference_peak else peak
+        normalised = power / peak
+        db = 10.0 * np.log10(np.maximum(normalised, 1e-20))
+        top = int(np.argmax(normalised))
+
+        tail = db[top : top + 8 * factor]
+        minima = np.flatnonzero((tail[1:-1] < tail[:-2]) & (tail[1:-1] < tail[2:])) + 1
+        sidelobe = float(tail[minima[0]:].max()) if minima.size else float("nan")
+
+        left = top
+        while db[left] > -3.0:
+            left -= 1
+        right = top
+        while db[right] > -3.0:
+            right += 1
+
+        rows.append({
+            "window": name,
+            "peak_position": top / factor,
+            "target_position": target,
+            "sidelobe_db": sidelobe,
+            "width_samples": (right - left) / factor,
+            "peak_loss_db": 10.0 * math.log10(peak / reference_peak),
+            "is_default": name == D.AZIMUTH_WINDOW,
+        })
+    return rows
 
 
 def experiment_space_variant_run(
