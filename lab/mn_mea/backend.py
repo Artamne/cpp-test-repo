@@ -153,9 +153,9 @@ def gpu_status() -> tuple[bool, str]:
         out = xp.abs(xp.fft.fft(xp.arange(4, dtype=xp.complex128)))
         bool(xp.all(out >= 0))
     except Exception as exc:
-        первая = str(exc).strip().splitlines()[0][:160] if str(exc).strip() else ""
+        first_line = str(exc).strip().splitlines()[0][:160] if str(exc).strip() else ""
         return False, (f"cupy импортируется, но не считает — {type(exc).__name__}"
-                       + (f": {первая}" if первая else ""))
+                       + (f": {first_line}" if first_line else ""))
     return True, "видеокарта считает"
 
 

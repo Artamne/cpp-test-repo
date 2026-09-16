@@ -150,9 +150,9 @@ def main(out_dir: pathlib.Path) -> int:
     # ---------------------------------------------------------------- §10.5
     say("## 6. Сверка двух бэкендов (§3, §10.5)")
     say()
-    годна, причина = B_.gpu_status()
-    if not годна:
-        say(f"Видеокарта не используется: {причина}.")
+    gpu_ok, gpu_reason = B_.gpu_status()
+    if not gpu_ok:
+        say(f"Видеокарта не используется: {gpu_reason}.")
         say()
     backends = V.experiment_backends()
     say(f"Доступные пути счёта: {', '.join(backends['available'])}. "
