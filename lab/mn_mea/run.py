@@ -543,7 +543,7 @@ def main(out_dir: pathlib.Path) -> int:
          (pathlib.Path(__file__).parent / "README.md").exists()
          and "решение реализации №4"
          in (pathlib.Path(__file__).parent / "README.md").read_text(encoding="utf-8").lower(),
-         "см. README.md, раздел «Четыре решения реализации»"),
+         "см. README.md, раздел «Решения реализации»"),
         ("9. Шесть расхождений книги помечены в коде по месту",
          all(_discrepancy_marks().values()),
          "помечены: " + ", ".join(tag for tag, found in _discrepancy_marks().items() if found)

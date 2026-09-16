@@ -225,7 +225,7 @@ def image_sharpness(backend, image) -> dict[str, float]:
     это ровно та линейная по k составляющая, к которой энтропия слепа (§7.2).
     Мера, чувствительная к сдвигу, объявила бы правильную работу провалом.
     """
-    g = backend.asarray(np.asarray(image))
+    g = backend.asarray(image)  # принимает и numpy, и массив с видеокарты
     M, N = g.shape
     S_g = float(backend.sum_real(backend.xp.abs(g) ** 2))  # (5-4) впрямую
     P, _, _ = C.image_power(backend, g, C.power_floor(S_g, M, N))
