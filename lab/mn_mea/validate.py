@@ -909,7 +909,7 @@ def experiment_full_run(
         phi_0 = B.initial_phase(eta, eps_reference)
 
         result = C.iterate_block(backend, h_block, phi_0, mu=MU_MEASURED,
-                                 step_max=step_max)
+                                 step_max=step_max, core=core)
         # решение реализации №5: линейную часть выбираем так, чтобы блок встал
         # на своё место на сцене; энтропии это не меняет — сдвиг целый.
         phi_final = (D.remove_image_shift(backend, result.phi) if deshift
@@ -1100,7 +1100,8 @@ def experiment_space_variant_run(
             D_x, D_y, block.x_centre, block.y_centre, x_p, y_p, q, block.q_k
         )
         phi_0 = B.initial_phase(eta, eps_reference)
-        result = C.iterate_block(backend, data.h, phi_0, mu=MU_MEASURED)
+        result = C.iterate_block(backend, data.h, phi_0, mu=MU_MEASURED,
+                                 core=(data.core_start, data.core_stop))
         phi_final = D.remove_image_shift(backend, result.phi)
         tile = D.block_image(backend, data.h, phi_final)
         images[block.q_k] = tile[data.core_start : data.core_stop]

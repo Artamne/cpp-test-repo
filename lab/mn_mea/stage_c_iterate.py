@@ -164,7 +164,35 @@ def image_power(backend: Backend, g, floor: float):
     return P, backend.xp.log(P), fraction
 
 
-def entropy(backend: Backend, P, S_g: float) -> tuple[float, float]:
+def core_mask(backend: Backend, M: int, core: tuple[int, int] | None):
+    """Маска строк изображения, по которым считается ЦЕЛЕВАЯ функция.
+
+    Принимает бэкенд, число строк M и границы сердцевины (start, stop);
+    возвращает столбец (M, 1) из единиц внутри сердцевины и нулей вне её,
+    либо None, если сердцевина — всё изображение.
+
+    Зачем. Окно блока (решение №6) шире его плитки: перехлёст нужен, чтобы
+    в данные попали ХВОСТЫ расфокусированных целей сердцевины. Но поправка
+    у блока ОДНА, и подгонять её надо под свою землю, а не под соседскую:
+    у соседа по (5-27) поправка ДРУГАЯ. Значит перехлёст обязан давать
+    данные и не давать голоса в целевой функции.
+
+    Маска и есть этот запрет. Суммы по m в (5-5), (5-14) и в первом члене
+    (5-19) идут только по сердцевине; лишнего БПФ это не стоит — нули
+    ставятся до преобразования.
+
+    S_g (5-4) остаётся энергией ВСЕГО окна: она не зависит от phi по
+    равенству Парсеваля, и на этом стоит вывод (5-13)/(5-19). Частичная
+    сумма от phi зависела бы, и вывод бы поехал.
+    """
+    if core is None:
+        return None
+    mask = backend.xp.zeros((M, 1), dtype=backend.real_dtype)
+    mask[core[0] : core[1]] = 1.0
+    return mask
+
+
+def entropy(backend: Backend, P, S_g: float, mask=None) -> tuple[float, float]:
     """(5-5) ненормированная энтропия и (5-6) нормированная.
 
     Принимает бэкенд, мощность P (5-4 уже посчитана как S_g) и S_g;
@@ -177,11 +205,14 @@ def entropy(backend: Backend, P, S_g: float) -> tuple[float, float]:
     нормировки ПФ не зависит и потому сравнима между блоками, E_g — нет.
     Накопление по M N ячейкам идёт в двойной точности (§3 задания).
     """
-    E_g = -float(backend.sum_real(P * backend.xp.log(P)))
+    weighted = P * backend.xp.log(P)
+    if mask is not None:
+        weighted = weighted * mask
+    E_g = -float(backend.sum_real(weighted))
     return E_g, E_g / S_g + math.log(S_g)
 
 
-def auxiliary_array(backend: Backend, ln_P, g):
+def auxiliary_array(backend: Backend, ln_P, g, mask=None):
     """(5-14), шаг 4 §5.8: G(k,n) = sum_m [1 + ln |g|^2] g(m,n) e^{+j 2 pi k m / M}.
 
     Принимает бэкенд, ln P и изображение g; возвращает массив G(k,n).
@@ -189,6 +220,8 @@ def auxiliary_array(backend: Backend, ln_P, g):
     Стоит ОДНО азимутальное БПФ (ядро «+»). Это второе и последнее БПФ итерации.
     """
     L = 1.0 + ln_P  # вещественный множитель
+    if mask is not None:  # перехлёст в целевую функцию не входит, см. core_mask
+        L = L * mask
     return backend.fft_kernel_plus(L.astype(g.dtype) * g)  # БПФ №2
 
 
@@ -221,7 +254,7 @@ def first_derivative(backend: Backend, W):
     return 2.0 * backend.sum_real(W.imag, axis=1)
 
 
-def second_derivative(backend: Backend, W, h_abs2, ln_P):
+def second_derivative(backend: Backend, W, h_abs2, ln_P, mask=None):
     """(5-19), шаг 7 §5.8: вторая производная энтропии по phi_k.
 
         E''_k = -2 sum_m sum_n (2 + ln|g|^2) |h(k,n)|^2
@@ -240,7 +273,10 @@ def second_derivative(backend: Backend, W, h_abs2, ln_P):
     получается из (5-15) при замене Im^2[g* u] на среднее (1/2)|g|^2 |h|^2,
     то есть (5-19) — это усреднённый, а не точный гессиан.
     """
-    W_n = backend.sum_real(2.0 + ln_P, axis=0)  # длины N
+    summand = 2.0 + ln_P
+    if mask is not None:  # тот же запрет для перехлёста, см. core_mask
+        summand = summand * mask
+    W_n = backend.sum_real(summand, axis=0)  # длины N
     # РАСХОЖДЕНИЕ (5-19): в книге напечатано иначе, см. §8 — коэффициент
     # (2 + ln|g|^2) дан без вывода; он получается из (5-15) при замене
     # Im^2[g* u] на среднее (1/2)|g|^2|h|^2, то есть гессиан усреднённый.
@@ -332,6 +368,7 @@ def iterate_block(
     floor_relative: float = POWER_FLOOR_RELATIVE,
     curvature_policy: str = "freeze",
     step_max: float = STEP_MAX_RAD,
+    core: tuple[int, int] | None = None,
 ) -> BlockIterations:
     """Цикл §5.8 целиком: девять шагов, два азимутальных БПФ размера M на
     итерацию и ничего больше.
@@ -349,6 +386,7 @@ def iterate_block(
     phi_initial_out = backend.to_numpy(phi).copy()
 
     M, N = h.shape
+    mask = core_mask(backend, M, core)  # решение №6: перехлёст без права голоса
     h_abs2 = backend.xp.abs(h) ** 2  # нужен (5-19) на каждой итерации, считаем один раз
     S_g = total_energy(backend, h_abs2, M)  # (5-4)
     floor = power_floor(S_g, M, N, floor_relative)  # решение реализации №1
@@ -368,11 +406,11 @@ def iterate_block(
 
         h_phi, g = image_from_phase(backend, h, phi)  # шаги 1-2, (5-3)
         P, ln_P, floored_fraction = image_power(backend, g, floor)  # шаг 3
-        E_g, S = entropy(backend, P, S_g)  # (5-5),(5-6) — для отчёта
-        G = auxiliary_array(backend, ln_P, g)  # шаг 4, (5-14)
+        E_g, S = entropy(backend, P, S_g, mask)  # (5-5),(5-6) — для отчёта
+        G = auxiliary_array(backend, ln_P, g, mask)  # шаг 4, (5-14)
         W = w_product(backend, G, h_phi)  # шаг 5 — один раз
         E_1 = first_derivative(backend, W)  # шаг 6, (5-13)
-        E_2 = second_derivative(backend, W, h_abs2, ln_P)  # шаг 7, (5-19)
+        E_2 = second_derivative(backend, W, h_abs2, ln_P, mask)  # шаг 7, (5-19)
 
         try:
             phi_new, n_frozen, n_clipped = newton_update(  # шаг 8, (5-8)
