@@ -125,7 +125,8 @@ def remove_first_degree_polynomial(phi: np.ndarray) -> np.ndarray:
     return phi - basis @ coeffs
 
 
-def ambiguity_fit(truth: np.ndarray, estimate: np.ndarray) -> tuple[float, float, np.ndarray]:
+def ambiguity_fit(truth: np.ndarray, estimate: np.ndarray,
+                  weight: np.ndarray | None = None) -> tuple[float, float, np.ndarray]:
     """§7.2 задания: подобрать тот самый полином первой степени по k, который
     вычитается из истины и из оценки, и вернуть остаток.
 
@@ -146,16 +147,22 @@ def ambiguity_fit(truth: np.ndarray, estimate: np.ndarray) -> tuple[float, float
     Максимум |sum_k e^{j(d_k - b k~)}| по b — это круговой аналог наименьших
     квадратов, и он же модуль ДПФ от e^{j d} по переменной b, поэтому
     ищется БПФ с передискретизацией и уточняется мелким перебором.
+
+    Необязательный weight — вес бина в подгонке, 0 или 1. Нужен, когда часть
+    доплеровской оси пуста: в незанятом бине фазы нет ни у истины, ни у
+    оценки, и включать его в подгонку значило бы подгонять под шум. Нулевой
+    вес выкидывает бин из суммы ТОЧНО, а не приближённо.
     """
     truth = np.asarray(truth, dtype=np.float64)
     estimate = np.asarray(estimate, dtype=np.float64)
     M = truth.size
     k = centred_bin_index(M)
-    z = np.exp(1j * (estimate - truth))
+    w = np.ones(M) if weight is None else np.asarray(weight, dtype=np.float64)
+    z = np.exp(1j * (estimate - truth)) * w
 
     oversample = 64
     grid = np.fft.fftfreq(M * oversample) * (2 * np.pi)
-    spectrum = np.abs(np.fft.fft(np.exp(1j * (estimate - truth))[np.argsort(k)], n=M * oversample))
+    spectrum = np.abs(np.fft.fft(z[np.argsort(k)], n=M * oversample))
     b_coarse = grid[int(np.argmax(spectrum))]
 
     step = 2 * np.pi / (M * oversample)
@@ -164,18 +171,31 @@ def ambiguity_fit(truth: np.ndarray, estimate: np.ndarray) -> tuple[float, float
     b = float(fine[int(np.argmax(resultant))])
 
     a = float(np.angle(np.sum(z * np.exp(-1j * b * k))))
-    residual = np.angle(z * np.exp(-1j * (a + b * k)))
+    # остаток считается по НЕВЗВЕШЕННОЙ разности: вес участвовал в подгонке,
+    # а не в самой разности, иначе в пустом бине получился бы угол нуля
+    residual = np.angle(np.exp(1j * (estimate - truth)) * np.exp(-1j * (a + b * k)))
     return a, b, residual
 
 
-def phase_residual_rms(truth: np.ndarray, estimate: np.ndarray) -> float:
+def phase_residual_rms(truth: np.ndarray, estimate: np.ndarray,
+                       occupied: np.ndarray | None = None) -> float:
     """§7.2 задания: ГЛАВНОЕ ЧИСЛО — среднеквадратичное расхождение внесённой
     и найденной фазы в радианах, после снятия одного и того же полинома
     первой степени по k из истины и из оценки.
 
-    Принимает истинную и оценённую фазу одной длины; возвращает СКО в радианах.
+    Принимает истинную и оценённую фазу одной длины и, необязательно, маску
+    занятых бинов; возвращает СКО в радианах.
+
+    Маска нужна на передискретизованных данных. В пустом бине сигнала нет,
+    фаза там не определена, и алгоритм её не ищет (решение №7). Считать такой
+    бин ошибкой — значит мерить не работу алгоритма, а шум: на стенде с
+    полосой 0,8 остаток без маски подскакивал с 0,046 до 0,93 рад.
     """
-    return float(np.sqrt(np.mean(ambiguity_fit(truth, estimate)[2] ** 2)))
+    if occupied is None:
+        return float(np.sqrt(np.mean(ambiguity_fit(truth, estimate)[2] ** 2)))
+    mask = np.asarray(occupied, dtype=bool)
+    residual = ambiguity_fit(truth, estimate, mask.astype(np.float64))[2]
+    return float(np.sqrt(np.mean(residual[mask] ** 2)))
 
 
 def azimuth_shift(image, reference) -> int:
@@ -563,6 +583,209 @@ def experiment_curvature_policy() -> dict:
     except C.CurvatureRefusal as exc:
         refused = str(exc)
     return {"freeze": frozen, "refusal_message": refused}
+
+
+#: Уровень шума приёмника в опыте с полосой, в долях СКО сигнала внутри
+#: полосы. -20 дБ — рабочая точка обычной записи: цели видны, фон различим.
+#: Шум кладётся по ВСЕЙ доплеровской оси, а не только в полосу: приёмник про
+#: диаграмму антенны ничего не знает, и именно поэтому пустые бины не пусты.
+BAND_NOISE_RELATIVE = 0.1
+
+
+def image_from_phase_for_report(backend, h, phi):
+    """(5-3) для замера энтропии ВНЕ итераций: та же пара, что шаги 1-2 §5.8.
+
+    Принимает бэкенд, h и фазу; возвращает (h e^{j phi}, g). Отдельная
+    обёртка нужна ровно затем, чтобы не повторять две строки в замерах, и
+    в стоимость итерации она не входит — считается вне цикла.
+    """
+    return C.image_from_phase(backend, backend.asarray(h), backend.asarray(phi))
+
+
+def experiment_seed_spread(seeds: int = 12) -> dict:
+    """Насколько «главное число» §7.2 зависит от того, какая выпала сцена.
+
+    Главный опыт стенда считает ОДНУ сцену с одним зерном. Этот опыт
+    повторяет его на нескольких и возвращает разброс, а заодно отвечает на
+    вопрос, который важнее самого разброса: КУДА приходит алгоритм, если не
+    в истину.
+
+    Для этого энтропия (5-6) считается в трёх точках — при phi = 0, при
+    ИСТИННОЙ фазе и при найденной. Если S(найдено) < S(истина), значит
+    итерации отработали верно, а минимум энтропии просто не лежит в истинной
+    точке: цель (5-6) и цель «угадать внесённую фазу» — разные цели.
+    """
+    backend = get_backend("auto")
+    M, N = 256, 64
+
+    def entropy_at(h, phi, S_g):
+        _, g = image_from_phase_for_report(backend, h, phi)
+        P, _, _ = C.image_power(backend, g, C.power_floor(S_g, M, N))
+        return C.entropy(backend, P, S_g)[1]
+
+    rows = []
+    for i in range(seeds):
+        rng = np.random.default_rng(20250915 + i)
+        sc = SY.scene("points_and_clutter", M, N, rng)
+        phi_err = SY.phase_error("quadratic", M, 3.0, rng)
+        h = SY.range_doppler_from_scene(backend, sc.image, phi_err)
+        r = C.iterate_block(backend, h, np.zeros(M), mu=MU_MEASURED)
+
+        sharp = lambda phi: image_sharpness(
+            backend, D.block_image(backend, h, phi))["contrast"]
+        c_zero, c_found, c_true = sharp(np.zeros(M)), sharp(r.phi), sharp(phi_err)
+        rows.append({
+            "seed": 20250915 + i,
+            "residual_rms_rad": phase_residual_rms(phi_err, r.phi),
+            "converged": r.converged,
+            "iterations": r.n_iterations,
+            "S_zero": entropy_at(h, np.zeros(M), r.S_g),
+            "S_true": entropy_at(h, phi_err, r.S_g),
+            "S_found": entropy_at(h, r.phi, r.S_g),
+            "contrast_zero": c_zero,
+            "contrast_found": c_found,
+            "contrast_true": c_true,
+            "share_of_ideal": (c_found - c_zero) / max(c_true - c_zero, 1e-12),
+        })
+
+    residuals = np.array([r["residual_rms_rad"] for r in rows])
+    deeper = sum(1 for r in rows if r["S_found"] < r["S_true"])
+    return {
+        "rows": rows,
+        "seeds": seeds,
+        "residual_median": float(np.median(residuals)),
+        "residual_min": float(residuals.min()),
+        "residual_max": float(residuals.max()),
+        "residual_spread": float(residuals.max() / max(residuals.min(), 1e-12)),
+        "deeper_than_truth": deeper,
+        "gap_median": float(np.median(
+            [r["S_true"] - r["S_found"] for r in rows])),
+        "share_of_ideal_median": float(np.median(
+            [r["share_of_ideal"] for r in rows])),
+    }
+
+
+def experiment_signal_band(seeds: int = 5) -> list[dict]:
+    """Решение реализации №7: что даёт заморозка пустых доплеровских бинов.
+
+    Стенд до сих пор работал с полосой во всю PRF — так устроена книга. На
+    записи это неверно: занятая доля равна отношению шага картинки к
+    разрешению, и у владельца она 11,6 %. Опыт повторяет это на данных, где
+    истинная фаза ИЗВЕСТНА, и меряет цену вопроса.
+
+    Полоса задаётся долей fraction; шум кладётся по ВСЕЙ оси, потому что
+    приёмник про диаграмму антенны ничего не знает. Каждый случай считается
+    дважды: с решением №7 и без него — floor_factor = inf выключает правило
+    ровно так, как было до него, объявляя живыми все бины.
+
+    Считается по нескольким сценам: одиночный замер здесь обманчив, разброс
+    между сценами велик (см. experiment_seed_spread).
+
+    Остаток берётся ТОЛЬКО по занятым бинам: в пустом фазы нет ни у истины,
+    ни у оценки, и записывать его в ошибку значит мерить шум.
+    """
+    backend = get_backend("auto")
+    M, N = 330, 96
+
+    rows = []
+    for fraction in (1.0, 0.8, 0.5, 0.25, 0.116):
+        acc: dict[str, list] = {}
+        occupied_true = live_on = 0
+        for i in range(seeds):
+            rng = np.random.default_rng(20250915 + i)
+            sc = SY.scene("points_and_clutter", M, N, rng)
+            phi_err = SY.phase_error("quadratic", M, 3.0, rng)
+            g_band = SY.azimuth_band_limit(sc.image, fraction)
+            h_clean = backend.to_numpy(
+                SY.range_doppler_from_scene(backend, g_band, phi_err))
+            # сравнение с НУЛЁМ не годится: БПФ оставляет в занулённых бинах
+            # порядка 1e-19, и «занятыми» оказались бы все. Порог относительный
+            power = np.sum(np.abs(h_clean) ** 2, axis=1)
+            occupied = power > 1e-12 * power.max()
+            occupied_true = int(occupied.sum())
+
+            scale = float(np.sqrt(np.mean(np.abs(h_clean[occupied]) ** 2)))
+            noise = (rng.normal(size=h_clean.shape)
+                     + 1j * rng.normal(size=h_clean.shape)) / np.sqrt(2.0)
+            h = h_clean + BAND_NOISE_RELATIVE * scale * noise
+
+            for label, factor in (("on", C.SIGNAL_FLOOR_FACTOR), ("off", math.inf)):
+                r = C.iterate_block(backend, h, np.zeros(M), mu=MU_MEASURED,
+                                    floor_factor=factor)
+                image = D.block_image(backend, backend.asarray(h), r.phi)
+                if label == "on":
+                    live_on = r.n_live_bins
+                acc.setdefault(f"iterations_{label}", []).append(r.n_iterations)
+                acc.setdefault(f"converged_{label}", []).append(int(r.converged))
+                acc.setdefault(f"pinned_{label}", []).append(sum(
+                    1 for c in r.criterion_history
+                    if abs(c - 2 * math.sin(0.5)) < 1e-3))
+                acc.setdefault(f"residual_{label}", []).append(
+                    phase_residual_rms(phi_err, r.phi, occupied))
+                acc.setdefault(f"contrast_{label}", []).append(
+                    image_sharpness(backend, image)["contrast"])
+
+        row = {"fraction": fraction, "occupied_true": occupied_true,
+               "live_on": live_on, "seeds": seeds}
+        for key, values in acc.items():
+            v = np.asarray(values, dtype=np.float64)
+            row[key] = float(np.median(v))
+            if key.startswith(("residual", "iterations")):
+                row[key + "_max"] = float(v.max())
+            if key.startswith("converged"):
+                row[key] = int(v.sum())
+        rows.append(row)
+    return rows
+
+
+def experiment_keep_best(seeds: int = 12) -> list[dict]:
+    """Решение реализации №8: возвращать лучшую посещённую точку, а не последнюю.
+
+    Ньютон (5-8) с диагональным гессианом спуска не гарантирует — направление
+    построено без перекрёстных членов. Опыт считает, как часто энтропия по
+    ходу итераций РАСТЁТ, и что даёт возврат лучшей точки.
+
+    Книга не нарушается: она говорит, когда остановиться (5-9), но не
+    говорит, какую точку считать ответом. По собственной мере алгоритма
+    ответ не может стать хуже — это свойство, а не замер.
+    """
+    backend = get_backend("auto")
+    M, N = 256, 64
+    rows = []
+    for scene_kind in SY.SCENES:
+        for mu in (0.03, MU_MEASURED):
+            last, best, rose, fired, worse_end = [], [], 0, 0, 0
+            iterations = 0
+            for i in range(seeds):
+                rng = np.random.default_rng(20250915 + i)
+                sc = SY.scene(scene_kind, M, N, rng)
+                phi_err = SY.phase_error("quadratic", M, 3.0, rng)
+                h = SY.range_doppler_from_scene(backend, sc.image, phi_err)
+
+                r_last = C.iterate_block(backend, h, np.zeros(M), mu=mu,
+                                         keep_best=False)
+                r_best = C.iterate_block(backend, h, np.zeros(M), mu=mu,
+                                         keep_best=True)
+                steps = np.diff(np.array(r_last.normalised_entropy_history))
+                rose += int((steps > 0).sum())
+                iterations += steps.size
+                fired += int(r_best.best_iteration <= r_best.n_iterations)
+                worse_end += int(r_last.normalised_entropy_final
+                                 > r_last.normalised_entropy_history[0] + 1e-12)
+                last.append(phase_residual_rms(phi_err, r_last.phi))
+                best.append(phase_residual_rms(phi_err, r_best.phi))
+            last, best = np.array(last), np.array(best)
+            rows.append({
+                "scene": scene_kind, "mu": mu, "seeds": seeds,
+                "iterations_total": iterations,
+                "entropy_rose": rose,
+                "kept_best": fired,
+                "worse_than_start": worse_end,
+                "residual_last": float(np.median(last)),
+                "residual_best": float(np.median(best)),
+                "wins": int((best < last - 1e-12).sum()),
+            })
+    return rows
 
 
 def experiment_step_limit() -> list[dict]:

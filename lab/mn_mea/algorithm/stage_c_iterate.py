@@ -68,6 +68,124 @@ POWER_FLOOR_RELATIVE = 1e-12
 #: 1 рад — лучшее по замеру.
 STEP_MAX_RAD = 1.0
 
+#: Решение реализации №7: во сколько раз мощность бина должна превышать
+#: МЕДИАНУ профиля, чтобы считать бин занятым сигналом.
+#:
+#: Зачем это вообще. Книга молча считает, что доплеровская ось занята
+#: целиком. На реальной записи это неверно: полоса доплера B_a = v/r_a, а
+#: частота повторения берётся с запасом, и занятая доля равна отношению
+#: ШАГА картинки к РАЗРЕШЕНИЮ. На записи владельца шаг 0,0464 м при
+#: разрешении 0,4 м — занято 11,6 % бинов, то есть 39 из 330 в блоке.
+#:
+#: Что делают остальные 291. В них нет сигнала, только шум приёмника. E''
+#: (5-19) там мал, Ньютон (5-8) выдаёт огромный шаг, шаг упирается в предел
+#: STEP_MAX_RAD, и критерий (5-9) встаёт РОВНО на 2|sin(1/2)| = 0,9589 и
+#: держится там вечно. Это тот же предельный цикл, что был при пределе pi,
+#: только теперь его устраивают пустые бины. Замер (M = 330, занято 39):
+#:
+#:   как есть        40 итераций, критерий 0,959 все 40, НЕ сошлось,
+#:                   |phi| вне полосы доходит до 5,48 рад — чистый шум
+#:   только полоса    7 итераций, критерий 0,959 -> 0,100, СОШЛОСЬ
+#:
+#: Почему медиана, а не доля энергии. Медиана профиля — это уровень шума,
+#: пока пустых бинов больше половины, и она не зависит от того, какую долю
+#: энергии шум набрал по всей оси. Замер на пяти уровнях шума (истина 39):
+#:
+#:   шум   доля энергии в полосе   керр 0,99   керр 0,999   мед x3   x10
+#:   0,00           1,0000               39           39       39    39
+#:   0,03           0,9933               39          282       39    39
+#:   0,10           0,9308              284          326       39    39
+#:   0,30           0,6197              322          330       39    39
+#:
+#: Почему именно 10. Отношение max/медиана РАЗВОДИТ два случая на два
+#: порядка, и 10 стоит посреди пустоты между ними:
+#:
+#:   стенд, ось занята целиком      points 1,0   +фон 1,2   только фон 1,4
+#:   запись, занято 11,6 %          шум 0,10 102   0,03 1106   0,01 9866
+#:
+#: Точечная цель даёт |h(k)| ПОСТОЯННУЮ по доплеру, поэтому у занятой
+#: целиком оси профиль плоский, и никакая яркость сцены его не вспучит.
+#: Первая попытка с порогом 3 и сторожем «живых больше половины» стенд
+#: сломала: живых оказалось НОЛЬ, заморозилось всё, энтропия не сдвинулась
+#: ни на единицу в последнем знаке, приёмка §10 провалила 3 пункта.
+SIGNAL_FLOOR_FACTOR = 10.0
+
+#: Часть того же решения №7: ниже скольких занятых бинов правило считает,
+#: что полосы нет вовсе, и отключается.
+#:
+#: Сторож против одиночного выброса. Медианное правило ищет то, что сильно
+#: выше шума; узкополосная помеха (одна частота на всю запись) выглядит
+#: ровно так же и заморозила бы всю остальную ось. Настоящая полоса шире
+#: единиц бинов — при M = 330 и занятости 11,6 % это 39. Число взято
+#: заведомо малым: оно не выбирает полосу, а лишь отличает полосу от
+#: выброса. Для сравнения, inputs.MIN_AZIMUTH_BINS = 16 — замеренный предел,
+#: ниже которого блок вообще не несёт разумной модели фазы.
+SIGNAL_MIN_LIVE = 8
+
+
+#: Решение реализации №8: возвращать ЛУЧШУЮ посещённую точку, а не последнюю.
+#:
+#: Ньютон (5-8) с диагональным («среднеполевым») гессианом спуска не
+#: гарантирует: направление -E'/E'' построено без перекрёстных членов, и шаг
+#: может пройти мимо. Книга сторожа не ставит, но она и не говорит, КАКУЮ
+#: точку считать ответом, — сказано лишь, когда остановиться (5-9).
+#:
+#: Замер на стенде, 72 прогона (три сцены x 12 сцен x два порога):
+#:
+#:   итераций всего 2222, энтропию УВЕЛИЧИЛИ 342 — 15,4 %
+#:   прогонов, где итог хуже лучшей посещённой точки: 24 из 72
+#:
+#: Что даёт возврат лучшей точки (медиана остатка по 12 сценам):
+#:
+#:   сцена                 mu      последняя   лучшая   лучше в
+#:   points                0,03      0,286      0,274    8/12
+#:   points_and_clutter    0,03      0,357      0,345    9/12
+#:   clutter_only          0,03      1,573      1,511    9/12
+#:
+#: Выигрыш скромный, 3-4 %, но он БЕСПЛАТНЫЙ: лишних БПФ нет, только копия
+#: массива фазы, и по собственной мере алгоритма (5-6) ответ не может стать
+#: хуже — это свойство, а не замер.
+#:
+#: Второе, ради чего это сделано. На реальной записи у владельца энтропия в
+#: двух блоках из девяти ВЫРОСЛА за прогон (12,3142 -> 12,3769 и 11,7879 ->
+#: 11,9368). Отчёт, в котором минимизируемая величина растёт, выглядит
+#: сломанным, и отличить настоящую беду от неудачного последнего шага в нём
+#: нельзя. С решением №8 «S после» не может превысить «S до» никогда.
+KEEP_BEST_ITERATE = True
+
+
+def signal_bins(backend: Backend, h_abs2, factor: float = SIGNAL_FLOOR_FACTOR):
+    """Решение №7: какие доплеровские бины несут сигнал, а какие пусты.
+
+    Принимает бэкенд, |h|^2 блока и порог над медианой; возвращает булев
+    массив длины M — True там, где сигнал есть.
+
+    Профиль p(k) = sum_n |h(k,n)|^2 — мощность по доплеровскому бину. Пустой
+    бин содержит только шум приёмника, и таких на передискретизованной
+    записи большинство; значит медиана профиля и ЕСТЬ уровень шума. Занятым
+    считается бин, который выше медианы в factor раз.
+
+    ДВА СЛУЧАЯ, КОГДА ПРАВИЛО ОТКЛЮЧАЕТСЯ, и оба возвращают «заняты все»:
+
+      * живых меньше SIGNAL_MIN_LIVE — это не полоса, а выброс (или ось
+        занята целиком и над медианой никто не вылез);
+      * живых больше половины оси — медиана попала в сигнал, разделять
+        нечего.
+
+    Геометрия здесь НЕ используется: этап C не читает ни одного параметра
+    движения (§2.1 документа), и это свойство сохраняется. Занятость меряется
+    по самим данным, а геометрия лишь предсказывает её (bench/run_real.py
+    печатает оба числа рядом — они обязаны сойтись).
+    """
+    xp = backend.xp
+    p = xp.sum(h_abs2.astype(backend.accum_real), axis=1)
+    floor = xp.median(p)
+    live = p > factor * floor
+    n_live = int(backend.sum_real(live.astype(backend.accum_real)))
+    if n_live < SIGNAL_MIN_LIVE or n_live > 0.5 * p.size:
+        return xp.ones_like(live)
+    return live
+
 
 class CurvatureRefusal(RuntimeError):
     """Отказ по решению реализации №2 при curvature_policy='raise':
@@ -94,6 +212,10 @@ class BlockIterations:
     floored_fraction: float = 0.0
     entropy_final: float = 0.0
     normalised_entropy_final: float = 0.0
+    #: решение №7: сколько доплеровских бинов признано занятыми сигналом
+    n_live_bins: int = 0
+    #: решение №8: номер итерации, чья фаза возвращена (1 — начальная точка)
+    best_iteration: int = 0
 
 
 def total_energy(backend: Backend, h_abs2, M: int) -> float:
@@ -292,6 +414,7 @@ def newton_update(
     backend: Backend,
     curvature_policy: str = "freeze",
     step_max: float = STEP_MAX_RAD,
+    live=None,
 ):
     """(5-8), шаг 8 §5.8: phi^(l+1) = phi^(l) - E'_k / E''_k.
 
@@ -313,23 +436,32 @@ def newton_update(
         где Ньютон выдал бы огромный шаг. Предел строго меньше pi, иначе
         упёршийся бин держит критерий (5-9) на его максимуме 2 навсегда;
         см. STEP_MAX_RAD и validate.experiment_step_limit.
+
+    Третье ограничение — решение реализации №7: бины, признанные пустыми
+    (live = False), не обновляются вовсе. Оценивать в них нечего, а Ньютон,
+    поделив на шум, гонял бы фазу по кругу и держал (5-9) на пределе шага.
     """
     xp = backend.xp
+    if live is None:
+        live = xp.ones(E_2.shape, dtype=bool)
     bad = E_2 <= 0.0
-    n_frozen = int(backend.sum_real(bad.astype(backend.accum_real)))
+    # заморожено ПО КРИВИЗНЕ — только там, где сигнал есть; в пустых бинах
+    # знак E'' ничего не означает, и мешать эти два счёта нельзя
+    n_frozen = int(backend.sum_real((bad & live).astype(backend.accum_real)))
+    hold = bad | ~live
 
     if n_frozen and curvature_policy == "raise":
-        which = np.flatnonzero(backend.to_numpy(bad))
+        which = np.flatnonzero(backend.to_numpy(bad & live))
         raise CurvatureRefusal(
-            f"(5-19) дала E'' <= 0 в {n_frozen} бинах из {E_2.size}: {which[:16].tolist()}"
-            f"{' …' if n_frozen > 16 else ''}. Ньютон (5-8) делит на E''; "
-            "шаг не определён, продолжать нельзя."
+            f"(5-19) дала E'' <= 0 в {n_frozen} занятых бинах из {E_2.size}: "
+            f"{which[:16].tolist()}{' …' if n_frozen > 16 else ''}. "
+            "Ньютон (5-8) делит на E''; шаг не определён, продолжать нельзя."
         )
-    if n_frozen == E_2.size:
+    if bool(xp.all(hold)):
         return phi, n_frozen, 0
 
-    safe = xp.where(bad, xp.ones_like(E_2), E_2)
-    step = xp.where(bad, xp.zeros_like(E_1), -E_1 / safe)
+    safe = xp.where(hold, xp.ones_like(E_2), E_2)
+    step = xp.where(hold, xp.zeros_like(E_1), -E_1 / safe)
 
     clipped = xp.abs(step) > step_max
     n_clipped = int(backend.sum_real(clipped.astype(backend.accum_real)))
@@ -338,7 +470,7 @@ def newton_update(
     return phi + step, n_frozen, n_clipped
 
 
-def stop_criterion(backend: Backend, phi_new, phi_old) -> float:
+def stop_criterion(backend: Backend, phi_new, phi_old, live=None) -> float:
     """(5-9), шаг 9 §5.8: max_k |exp(j phi^(l+1)_k) - exp(j phi^(l)_k)|.
 
     Принимает бэкенд, новую и старую фазу; возвращает одно вещественное число,
@@ -351,12 +483,19 @@ def stop_criterion(backend: Backend, phi_new, phi_old) -> float:
 
     В книге (5-9) напечатано без модуля — см. §8 документа: комплексная
     величина сравнивается с вещественным порогом.
+
+    Максимум берётся только по ЗАНЯТЫМ бинам (решение №7): пустой бин не
+    обновляется, его разность тождественно ноль, и в максимум он всё равно
+    не попадёт — но если бы правило №7 было выключено, именно он держал бы
+    критерий на пределе шага.
     """
     xp = backend.xp
-    diff = xp.exp(1j * phi_new) - xp.exp(1j * phi_old)
+    diff = xp.abs(xp.exp(1j * phi_new) - xp.exp(1j * phi_old))
+    if live is not None:
+        diff = xp.where(live, diff, xp.zeros_like(diff))
     # РАСХОЖДЕНИЕ (5-9): в книге напечатано иначе, см. §8 — без модуля |.|
     # комплексная величина сравнивалась бы с вещественным порогом.
-    return float(xp.max(xp.abs(diff)))
+    return float(xp.max(diff))
 
 
 def iterate_block(
@@ -369,6 +508,8 @@ def iterate_block(
     curvature_policy: str = "freeze",
     step_max: float = STEP_MAX_RAD,
     core: tuple[int, int] | None = None,
+    floor_factor: float = SIGNAL_FLOOR_FACTOR,
+    keep_best: bool = KEEP_BEST_ITERATE,
 ) -> BlockIterations:
     """Цикл §5.8 целиком: девять шагов, два азимутальных БПФ размера M на
     итерацию и ничего больше.
@@ -388,6 +529,7 @@ def iterate_block(
     M, N = h.shape
     mask = core_mask(backend, M, core)  # решение №6: перехлёст без права голоса
     h_abs2 = backend.xp.abs(h) ** 2  # нужен (5-19) на каждой итерации, считаем один раз
+    live = signal_bins(backend, h_abs2, floor_factor)  # решение №7, один раз
     S_g = total_energy(backend, h_abs2, M)  # (5-4)
     floor = power_floor(S_g, M, N, floor_relative)  # решение реализации №1
 
@@ -398,15 +540,21 @@ def iterate_block(
         converged=False,
         stop_reason="",
         S_g=S_g,
+        n_live_bins=int(backend.sum_real(live.astype(backend.accum_real))),
     )
 
     floored_fraction = 0.0
+    best_S, best_phi, best_at = None, None, 0
     for _ in range(max_iterations):
         before = backend.counters.snapshot()
 
         h_phi, g = image_from_phase(backend, h, phi)  # шаги 1-2, (5-3)
         P, ln_P, floored_fraction = image_power(backend, g, floor)  # шаг 3
         E_g, S = entropy(backend, P, S_g, mask)  # (5-5),(5-6) — для отчёта
+
+        # решение №8: эта точка уже оценена по (5-6), запомнить её лучшую
+        if keep_best and (best_S is None or S < best_S):
+            best_S, best_phi, best_at = S, phi, out.n_iterations + 1
         G = auxiliary_array(backend, ln_P, g, mask)  # шаг 4, (5-14)
         W = w_product(backend, G, h_phi)  # шаг 5 — один раз
         E_1 = first_derivative(backend, W)  # шаг 6, (5-13)
@@ -414,7 +562,7 @@ def iterate_block(
 
         try:
             phi_new, n_frozen, n_clipped = newton_update(  # шаг 8, (5-8)
-                phi, E_1, E_2, backend, curvature_policy, step_max
+                phi, E_1, E_2, backend, curvature_policy, step_max, live
             )
         except CurvatureRefusal as exc:
             out.stop_reason = f"отказ по решению №2: {exc}"
@@ -422,7 +570,7 @@ def iterate_block(
             out.normalised_entropy_history.append(S)
             break
 
-        criterion = stop_criterion(backend, phi_new, phi)  # шаг 9, (5-9)
+        criterion = stop_criterion(backend, phi_new, phi, live)  # шаг 9, (5-9)
 
         after = backend.counters.snapshot()
         out.fft_per_iteration.append((after[0] - before[0]) + (after[1] - before[1]))
@@ -436,10 +584,11 @@ def iterate_block(
         phi = phi_new
         out.n_iterations += 1
 
-        if n_frozen == M:
+        if n_frozen == out.n_live_bins:
             out.stop_reason = (
-                f"(5-19) дала E'' <= 0 во всех {M} бинах: квадратичная модель "
-                "не имеет минимума, двигаться некуда — это НЕ сходимость"
+                f"(5-19) дала E'' <= 0 во всех {n_frozen} занятых бинах: "
+                "квадратичная модель не имеет минимума, двигаться некуда — "
+                "это НЕ сходимость"
             )
             break
         if criterion <= mu:
@@ -453,12 +602,24 @@ def iterate_block(
             "это НЕ сходимость"
         )
 
-    out.phi = backend.to_numpy(phi).astype(np.float64)
     out.floored_fraction = floored_fraction
 
     # Итоговая энтропия — ещё одно (5-3), уже ВНЕ цикла: это то же вычисление,
-    # которое делает этап D, и в стоимость итерации оно не входит.
+    # которое делает этап D, и в стоимость итерации оно не входит. Последняя
+    # точка внутри цикла не оценивалась — цикл считает (5-6) ДО обновления, —
+    # поэтому она оценивается здесь, и только теперь решение №8 может
+    # выбирать между ней и лучшей запомненной.
     _, g_final = image_from_phase(backend, h, phi)
     P_final, _, _ = image_power(backend, g_final, floor)
+    E_last, S_last = entropy(backend, P_final, S_g, mask)
+    out.best_iteration = out.n_iterations + 1
+
+    if keep_best and best_S is not None and best_S < S_last:
+        phi = best_phi
+        out.best_iteration = best_at
+        _, g_final = image_from_phase(backend, h, phi)
+        P_final, _, _ = image_power(backend, g_final, floor)
+
+    out.phi = backend.to_numpy(phi).astype(np.float64)
     out.entropy_final, out.normalised_entropy_final = entropy(backend, P_final, S_g)
     return out

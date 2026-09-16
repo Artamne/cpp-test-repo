@@ -21,6 +21,7 @@
     find_companions     найти vel-npz и check-json рядом с rda
     read_h5_passport    паспорт из самого h5: params + __extra__ + stage
     read_velocity       матрица скорости: выбрать согласную зону
+    narrow_velocity     пересчитать скорость по ячейкам ВНУТРИ среза
     range_axis_metres   ось дальности в метрах
     choose_slice        границы среза по дальности и по азимуту
     read_slice          прочитать окно и перевернуть в (азимут, дальность)
@@ -190,6 +191,37 @@ def read_velocity(vel_path: str) -> dict:
     }
 
 
+def narrow_velocity(vel: dict, a0: int, a1: int) -> dict:
+    """Пересчитать скорость по тем ячейкам, что попали В САМ СРЕЗ.
+
+    Принимает выбор скорости и границы окна по азимуту; возвращает такой же
+    словарь, но со скоростью, усреднённой только по ячейкам внутри окна.
+
+    Зачем. read_velocity усредняет по всей зоне дальности, а зона тянется на
+    всю запись: на записи владельца ячейки расходятся от 26,7 до 53,2 м/с —
+    вдвое. Срез же занимает малую её часть, и скорость в паспорте обязана
+    описывать СРЕЗ, а не всю трассу. Замер на его данных: по всей зоне
+    выходит 36,273 м/с, по двум ячейкам внутри окна — около 38,5 м/с,
+    разница 6 %. Она входит в T_a и в шаг картинки v/PRF, то есть прямо в
+    размер блока.
+
+    Проход ровно один. Новая скорость меняет длину апертуры, а та — границы
+    окна, и строго это решалось бы итерацией; но поправка порядка процентов,
+    и цена ошибки в T_a — те же проценты в размере блока. Второй проход
+    гонялся бы за собственным хвостом.
+
+    Если внутри окна не оказалось ни одной ячейки, возвращается исходный
+    выбор без изменений: выдумывать тут нечего, и main об этом говорит.
+    """
+    inside = [(a, v, w) for a, v, w in vel["kept"] if a0 <= a < a1]
+    if not inside:
+        return dict(vel, narrowed=False, kept_inside=0)
+    w = np.array([c[2] for c in inside])
+    v = np.array([c[1] for c in inside])
+    return dict(vel, v=float(np.sum(w * v) / np.sum(w)), kept=inside,
+                narrowed=True, kept_inside=len(inside), v_wide=vel["v"])
+
+
 def range_axis_metres(passport: dict, check: dict, ka_dir: str) -> np.ndarray:
     """Ось дальности в метрах, по одному числу на строб.
 
@@ -327,8 +359,10 @@ def build_meta(rda_path: str, passport: dict, check: dict, vel: dict,
         "только в знаменатель (5-29) через полуразмер блока по дальности; "
         "на нарезку при N_k = 1 не влияет",
         f"скорость взята одним числом {v:.3f} м/с — взвешенное среднее "
-        f"{len(vel['kept'])} согласных ячеек матрицы в зоне r_bin="
-        f"{vel['r_bin']}; книга требует одно число на апертуру",
+        f"{len(vel['kept'])} ячеек матрицы"
+        + (" ВНУТРИ окна среза" if vel.get("narrowed")
+           else f" в зоне r_bin={vel['r_bin']}, внутри окна ячеек нет")
+        + "; книга требует одно число на апертуру",
     ]
     if rho_src != "паспорт":
         assumptions.append(
@@ -474,6 +508,15 @@ def main() -> None:
 
     cut = choose_slice(R_axis, vel, passport["shape"][1], prf, lambda_,
                        rho_a, gamma)
+    vel = narrow_velocity(vel, cut["a0"], cut["a1"])
+    if vel.get("narrowed"):
+        print(f"  внутри окна {vel['kept_inside']} ячеек, скорость по ним "
+              f"{vel['v']:.3f} м/с (по всей зоне было {vel['v_wide']:.3f})")
+        cut = choose_slice(R_axis, vel, passport["shape"][1], prf, lambda_,
+                           rho_a, gamma)
+    else:
+        print("  ВНИМАНИЕ: внутри окна нет ни одной ячейки скорости; взята "
+              "скорость по всей зоне, она может описывать не этот срез")
     print(f"\nсрез")
     print(f"  R_B0 = {cut['R_B0']:.1f} м, T_a = {cut['T_a']:.4f} с, "
           f"M_aperture = {cut['M_aperture']}")

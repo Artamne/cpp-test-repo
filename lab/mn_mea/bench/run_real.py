@@ -1,10 +1,11 @@
 """Прогон MN-MEA на срезе РЕАЛЬНОЙ записи, подготовленном prepare_slice.py.
 
-    python3 bench/run_real.py путь/к/mn_mea_srez [M_k x N_k]
+    python3 bench/run_real.py путь/к/mn_mea_srez [M_k x N_k] [mu]
 
 Читает h_srez.npy и meta.json, проверяет вход, считает, кладёт рядом
 картинки до и после и числа. Сетку блоков можно задать вторым аргументом,
-например 8x1; без него берётся (5-20) по геометрии из паспорта.
+например 8x1; без него берётся (5-20) по геометрии из паспорта. Третьим —
+порог останова (5-9), по умолчанию MU_REAL.
 
 ЧЕМ ЭТОТ ПРОГОН ОТЛИЧАЕТСЯ ОТ СТЕНДА, и это главное.
 
@@ -51,6 +52,31 @@ from stage_a_blocks import Geometry
 from validate import image_sharpness
 
 
+#: Порог останова (5-9) для прогона на записи. НЕ равен MU_MEASURED стенда.
+#:
+#: Стенд берёт 1e-3, и для него это верно: там меряют точность, а не время.
+#: Его же таблица (отчёт, решение №4) показывает, где на самом деле колено:
+#:
+#:   mu     итераций   остаток, рад
+#:   0,1       10       1,118e-01
+#:   0,03      13       5,781e-02     <- точность уже полная
+#:   0,01      15       5,803e-02
+#:   0,001     18       5,893e-02
+#:
+#: На записи разница куда заметнее, потому что блок больше. Замер на срезе
+#: 457x200 с занятой полосой 12,5 %:
+#:
+#:   mu      итераций  сошлось   S итог
+#:   0,1        9        да      6,9974
+#:   0,03      12        да      6,9811
+#:   0,001     40        НЕТ     6,9787
+#:
+#: То есть 1e-3 стоит вчетверо больше итераций и приносит 0,003 энтропии —
+#: три сотых процента. И, что хуже, все блоки докладывают «не сошлось», а
+#: этот признак нужен как диагностика, а не как всегдашняя надпись.
+MU_REAL = 0.03
+
+
 def read_slice(directory: pathlib.Path) -> tuple[np.ndarray, dict]:
     """Прочитать срез и паспорт.
 
@@ -85,7 +111,7 @@ def geometry_from_meta(meta: dict) -> Geometry:
 
 
 def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
-          mu: float = 1e-3) -> dict:
+          mu: float = MU_REAL) -> dict:
     """Собственно прогон: блоки, этап C из нуля, этап D.
 
     Принимает h, Geometry, сетку блоков (или None — тогда по (5-20)) и порог
@@ -128,6 +154,8 @@ def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
             "entropy_before": result.normalised_entropy_history[0],
             "entropy_after": result.normalised_entropy_final,
             "frozen_bins": int(sum(result.frozen_bins_history)),
+            "live_bins": result.n_live_bins,
+            "block_bins": L,
         })
     return {
         "blocks": blocks, "M_k": M_k, "N_k": N_k, "per_block": rows,
@@ -136,6 +164,32 @@ def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
         "image_after": backend.to_numpy(D.assemble(backend, after, blocks, M, N)),
         "backend": backend,
     }
+
+
+def band_occupancy(backend, h, geom: Geometry) -> list[str]:
+    """Сколько доплеровской оси занято сигналом — по данным и по геометрии.
+
+    Принимает бэкенд, срез h и Geometry; возвращает строки для печати.
+
+    Зачем это первым делом. Книга молча считает ось занятой целиком. На
+    записи занятая доля равна отношению ШАГА картинки к РАЗРЕШЕНИЮ: полоса
+    доплера B_a = v/r_a, частота повторения PRF = v/шаг, их отношение и есть
+    доля. Если она мала, большая часть бинов — чистый шум, и фаза в них не
+    определена (решение реализации №7). Число, посчитанное по данным, и
+    число, обещанное геометрией, обязаны сойтись; расхождение значит, что
+    паспорт описывает не эти данные.
+    """
+    h_dev = backend.asarray(h)
+    live = C.signal_bins(backend, backend.xp.abs(h_dev) ** 2)
+    measured = float(backend.sum_real(live.astype(backend.accum_real))) / h.shape[0]
+    promised = geom.azimuth_step / geom.r_a
+    return [
+        f"полоса доплера занята: по данным {100 * measured:.1f} %, "
+        f"по геометрии {100 * promised:.1f} % (шаг/разрешение)",
+        "  пустые бины несут только шум; фаза в них не оценивается "
+        "(решение №7)" if measured < 0.5 else
+        "  ось занята целиком — решение №7 не вмешивается",
+    ]
 
 
 def grid_agreement(meta: dict, m_p: float, n_p: float,
@@ -193,6 +247,7 @@ def main() -> int:
     if len(sys.argv) > 2:
         a, b = sys.argv[2].lower().split("x")
         grid = (int(a), int(b))
+    mu = float(sys.argv[3]) if len(sys.argv) > 3 else MU_REAL
 
     h, meta = read_slice(directory)
     geom = geometry_from_meta(meta)
@@ -211,17 +266,22 @@ def main() -> int:
     for name, value in inputs.derived_numbers(geom, *h.shape).items():
         print(f"  {name:24} {value:.3f}")
 
-    run = focus(h, geom, grid)
-    print(f"\nсетка блоков {run['M_k']}x{run['N_k']}, "
+    print()
+    for line in band_occupancy(get_backend("auto"), h, geom):
+        print(line)
+
+    run = focus(h, geom, grid, mu=mu)
+    print(f"\nсетка блоков {run['M_k']}x{run['N_k']}, порог (5-9) mu = {mu:g}, "
           f"начальная фаза нулевая (этап B не делается)")
     for line in grid_agreement(meta, run["m_p"], run["n_p"],
                                None if grid else run["N_k"]):
         print(line)
-    print(f"\n{'блок':>5}{'размер':>10}{'итер':>6}{'сошлось':>9}"
+    print(f"\n{'блок':>5}{'размер':>10}{'занято':>14}{'итер':>6}{'сошлось':>9}"
           f"{'S до':>9}{'S после':>9}{'заморожено':>12}")
     for row in run["per_block"]:
         size = f"{row['shape'][0]}x{row['shape'][1]}"
-        print(f"{row['q_k']:>5}{size:>10}{row['iterations']:>6}"
+        live = f"{row['live_bins']}/{row['block_bins']}"
+        print(f"{row['q_k']:>5}{size:>10}{live:>14}{row['iterations']:>6}"
               f"{str(row['converged']):>9}{row['entropy_before']:>9.4f}"
               f"{row['entropy_after']:>9.4f}{row['frozen_bins']:>12}")
 
