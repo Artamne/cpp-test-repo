@@ -26,6 +26,7 @@
     experiment_linearisation         этап B       восстановление k_10,k_20,k_30
     experiment_block_criterion       §4           (5-20) выполняется
     experiment_block_transform       §5           длина (5-3): блок или сцена
+    experiment_image_shift           решение №5   снятие сдвига блока
     experiment_full_run              §10.4        A->B->C->D целиком
 """
 
@@ -161,6 +162,27 @@ def phase_residual_rms(truth: np.ndarray, estimate: np.ndarray) -> float:
     Принимает истинную и оценённую фазу одной длины; возвращает СКО в радианах.
     """
     return float(np.sqrt(np.mean(ambiguity_fit(truth, estimate)[2] ** 2)))
+
+
+def azimuth_shift(image, reference) -> int:
+    """Циклический сдвиг по азимуту между двумя картинками, в отсчётах.
+
+    Принимает две картинки (M, N) одного размера; возвращает целое число:
+    на сколько отсчётов первая уехала относительно второй.
+
+    Считается по максимуму взаимной корреляции модулей, просуммированной по
+    стробам дальности. На блоке без точечных целей это число смысла почти не
+    имеет — спекл ни с чем не коррелирует, — и в опытах такие блоки считаются
+    отдельно.
+    """
+    a = np.abs(np.asarray(image))
+    b = np.abs(np.asarray(reference))
+    corr = np.fft.ifft(
+        np.fft.fft(a, axis=0) * np.conj(np.fft.fft(b, axis=0)), axis=0
+    ).real.sum(axis=1)
+    M = a.shape[0]
+    s_max = int(np.argmax(corr))
+    return s_max - M if s_max > M // 2 else s_max
 
 
 def truth_on_block_grid(phi_true: np.ndarray, m_block: int) -> np.ndarray:
@@ -804,7 +826,7 @@ def experiment_block_criterion() -> dict:
 
 def experiment_full_run(
     M: int = 256, N: int = 96, seed: int = 20250915, eta_offset: bool = True,
-    scene_transform: bool = False,
+    scene_transform: bool = False, deshift: bool = True,
 ) -> dict:
     """§10.4 задания: полный прогон A->B->C->D на синтетике.
 
@@ -820,6 +842,9 @@ def experiment_full_run(
     scene_transform=True берёт (5-3) длиной во всю сцену вместо длины блока —
     тоже ЗАМЕР, а не вторая реализация: см. experiment_block_transform. По
     умолчанию делается так, как написано в §5: «далее M, N — размеры блока».
+
+    deshift=False отключает решение реализации №5 (снятие сдвига блока перед
+    укладкой) — снова ЗАМЕР его цены, см. experiment_image_shift.
     """
     geom = DEMO_GEOMETRY
     backend = get_backend("auto")
@@ -873,7 +898,11 @@ def experiment_full_run(
         phi_0 = B.initial_phase(eta, eps_reference)
 
         result = C.iterate_block(backend, h_block, phi_0, mu=MU_MEASURED)
-        tile = D.block_image(backend, h_block, result.phi)
+        # решение реализации №5: линейную часть выбираем так, чтобы блок встал
+        # на своё место на сцене; энтропии это не меняет — сдвиг целый.
+        phi_final = (D.remove_image_shift(backend, result.phi) if deshift
+                     else np.asarray(result.phi))
+        tile = D.block_image(backend, h_block, phi_final)
         tile_zero = D.block_image(backend, h_block, np.zeros(M_block))
         leak = 0.0  # у блочного (5-3) энергии некуда деться: свёртка круговая
         if scene_transform:  # изображение вышло во всю сцену, берётся полоса блока
@@ -887,6 +916,10 @@ def experiment_full_run(
         images_before[block.q_k] = tile_zero
 
         truth_block = truth_on_block_grid(phi_err, M_block)
+        ideal_tile = sc.image[block.m_start : block.m_stop, block.n_start : block.n_stop]
+        n_points = sum(1 for (pm, pn) in sc.points
+                       if block.m_start <= pm < block.m_stop
+                       and block.n_start <= pn < block.n_stop)
         per_block.append({
             "q_k": block.q_k, "m_k": block.m_k, "n_k": block.n_k,
             "shape": block.shape,
@@ -897,7 +930,9 @@ def experiment_full_run(
             "stop_reason": result.stop_reason,
             "entropy_before": result.normalised_entropy_history[0],
             "entropy_after": result.normalised_entropy_final,
-            "residual_rms_rad": phase_residual_rms(truth_block, result.phi),
+            "residual_rms_rad": phase_residual_rms(truth_block, phi_final),
+            "n_points": n_points,
+            "azimuth_shift": azimuth_shift(backend.to_numpy(tile), ideal_tile),
             "initial_rms_rad": phase_residual_rms(truth_block, phi_0),
             "frozen_bins_total": int(sum(result.frozen_bins_history)),
             "leak_fraction": leak,
@@ -946,6 +981,46 @@ def experiment_eta_term() -> dict:
             "converged_blocks": run["converged_blocks"],
             "q": run["q"],
             "mean_residual_rms_rad": run["mean_residual_rms_rad"],
+        }
+    return rows
+
+
+def experiment_image_shift(
+    seeds: tuple[int, ...] = (20250915, 7, 101), kinds: tuple[str, ...] = ("mixture", "cubic")
+) -> dict:
+    """Решение реализации №5: снятие сдвига блока перед укладкой (5-26).
+
+    Энтропия слепа к линейной по k фазе, поэтому каждый блок приходит со
+    СВОИМ произвольным сдвигом, и мозаика (5-26) разъезжается. Снятие сдвига
+    описано в stage_d_assemble.remove_image_shift; чего оно стоит — здесь.
+
+    Считается на нескольких сценах и видах ошибки, с флагом и без. Блоки с
+    точечными целями и без них считаются ОТДЕЛЬНО: на блоке без целей сама
+    мера сдвига почти бессмысленна, там спекл, и смешивать их — значит
+    получить число, которое ничего не говорит ни о том, ни о другом.
+    """
+    rows: dict[str, dict] = {}
+    for label, flag in (("со снятием (рабочая форма)", True), ("без снятия", False)):
+        with_points: list[int] = []
+        without_points: list[int] = []
+        entropy_shift = 0.0
+        for seed in seeds:
+            for kind in kinds:
+                run = experiment_full_run(seed=seed, deshift=flag)
+                for b in run["per_block"]:
+                    (with_points if b["n_points"] else without_points).append(
+                        abs(b["azimuth_shift"])
+                    )
+                entropy_shift = max(entropy_shift, abs(
+                    np.mean([b["entropy_after"] for b in run["per_block"]])
+                ))
+        rows[label] = {
+            "blocks_with_points": len(with_points),
+            "on_place_percent": 100.0 * float(np.mean(np.array(with_points) == 0)),
+            "mean_shift": float(np.mean(with_points)),
+            "worst_shift": int(np.max(with_points)),
+            "mean_shift_no_points": float(np.mean(without_points)),
+            "mean_entropy": entropy_shift,
         }
     return rows
 
