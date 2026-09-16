@@ -142,11 +142,37 @@ stage_a  ←  stage_b, stage_d
 
 ### Прогон на реальной записи
 
-Подготовленный срез — каталог с `h_srez.npy` и `meta.json` — подаётся так:
+Два шага, и в каждом данные выбираются по-своему.
+
+**Шаг 1, подготовка среза.** Делается скриптом `prepare_slice.py` на машине,
+где лежит запись; в репозитории его нет, он привязан к формату конкретного
+`.mat`. Файл в нём выбирается **правкой трёх строк сверху**, аргументов
+командной строки скрипт не принимает:
+
+```python
+DATA_DIR = r"E:\Work\__Galogram__\cluade\RSA_MAX"
+RCMC_NAME = "SAR_RCMC_Result.mat"
+PARAMS_NAME = "SAR_RDA_Params.mat"
+```
+
+Кладёт результат в `DATA_DIR\mn_mea_srez`: `h_srez.npy`, `meta.json`,
+`srez.png`. Нужны `h5py` и `scipy` — в `requirements.txt` их нет, это
+зависимости подготовки, а не алгоритма.
+
+**Шаг 2, прогон.** `run_real.py` файл не выбирает вовсе: ему даётся
+**каталог** `mn_mea_srez` целиком, имена внутри фиксированы.
 
 ```
 python3 bench/run_real.py путь/к/mn_mea_srez          # сетка блоков по (5-20)
 python3 bench/run_real.py путь/к/mn_mea_srez 8x1      # сетка рукой
+```
+
+На Windows — из каталога `lab\mn_mea` клона, с включённым venv:
+
+```
+.venv\Scripts\activate
+cd путь\к\клону\lab\mn_mea
+python bench\run_real.py E:\Work\__Galogram__\cluade\RSA_MAX\mn_mea_srez
 ```
 
 Печатает замечания по входу (`inputs.check_inputs`), числа, которые даёт
