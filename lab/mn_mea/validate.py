@@ -17,6 +17,7 @@
     experiment_power_floor           решение №1   влияние порога на энтропию
     experiment_normalisation         решение №3   шаг не зависит от нормировки
     experiment_curvature_policy      решение №2   сторож на E'' <= 0
+    experiment_step_limit            решение №2   предел шага (5-8) замером
     experiment_edge_cases            §7.5         края
     experiment_backends              §3, §10.5    сверка двух бэкендов
     experiment_iteration_cost        §10.6,§10.7  два БПФ и один W, счётчиком
@@ -24,6 +25,7 @@
     experiment_straight_flight       §4           прямолинейный полёт
     experiment_linearisation         этап B       восстановление k_10,k_20,k_30
     experiment_block_criterion       §4           (5-20) выполняется
+    experiment_block_transform       §5           длина (5-3): блок или сцена
     experiment_full_run              §10.4        A->B->C->D целиком
 """
 
@@ -159,6 +161,55 @@ def phase_residual_rms(truth: np.ndarray, estimate: np.ndarray) -> float:
     Принимает истинную и оценённую фазу одной длины; возвращает СКО в радианах.
     """
     return float(np.sqrt(np.mean(ambiguity_fit(truth, estimate)[2] ** 2)))
+
+
+def truth_on_block_grid(phi_true: np.ndarray, m_block: int) -> np.ndarray:
+    """Истинная фаза, снятая на доплеровскую сетку блока.
+
+    Принимает истину длины M (сетка апертуры) и число бинов блока m_block;
+    возвращает вектор длины m_block.
+
+    Сравнивать найденную блоком фазу с ОТРЕЗКОМ истины нельзя, и это не
+    придирка, а источник неверного вывода: блок из m_block бинов накрывает
+    ту же полосу доплера, что и вся апертура, только реже — его бину j
+    отвечает частота j/m_block от полосы, а не j-й бин апертуры. Поэтому
+    истина не режется, а пересчитывается на сетку блока по нормированной
+    частоте (край апертуры = +-1). Фаза для этого достаточно плавная: (5-27)
+    квадратична по f_a, а внесённое в стенде дрожание ограничено гармониками
+    JITTER_HARMONICS.
+    """
+    M = np.asarray(phi_true).size
+    u_full = np.fft.fftfreq(M) * 2.0
+    u_block = np.fft.fftfreq(m_block) * 2.0
+    order = np.argsort(u_full)
+    return np.interp(u_block, u_full[order], np.asarray(phi_true)[order])
+
+
+def image_sharpness(backend, image) -> dict[str, float]:
+    """Резкость ГОТОВОГО изображения тремя числами, без обращения к истине.
+
+    Принимает бэкенд и комплексное изображение; возвращает
+    {'S': нормированная энтропия (5-6), 'contrast': ..., 'peak': ...}.
+
+    Истина для этих чисел не нужна, и в этом всё дело: сравнивать два способа
+    обработки по остатку фазы можно лишь когда у них ОДНА сетка, а у блочного
+    и сценного преобразований она разная. Готовая картинка — общий знаменатель.
+
+    Все три числа не меняются при циклическом сдвиге изображения, а сдвиг —
+    это ровно та линейная по k составляющая, к которой энтропия слепа (§7.2).
+    Мера, чувствительная к сдвигу, объявила бы правильную работу провалом.
+    """
+    g = backend.asarray(np.asarray(image))
+    M, N = g.shape
+    S_g = float(backend.sum_real(backend.xp.abs(g) ** 2))  # (5-4) впрямую
+    P, _, _ = C.image_power(backend, g, C.power_floor(S_g, M, N))
+    _, S = C.entropy(backend, P, S_g)
+    intensity = np.abs(backend.to_numpy(g)) ** 2
+    return {
+        "S": S,
+        "contrast": float(np.sqrt((intensity**2).mean()) / intensity.mean()),
+        "peak": float(np.sqrt(intensity.max())),
+    }
 
 
 def point_target_metrics(image: np.ndarray, row: int, col: int) -> dict[str, float]:
@@ -413,6 +464,60 @@ def experiment_curvature_policy() -> dict:
     return {"freeze": frozen, "refusal_message": refused}
 
 
+def experiment_step_limit() -> list[dict]:
+    """Решение реализации №2, часть вторая: чем ограничивать шаг (5-8).
+
+    Предел не выбирается по вкусу, а замеряется: полный набор блоков полного
+    прогона считается при нескольких значениях, и смотрят, сколько блоков
+    доходит до (5-9) и какой остаётся остаток.
+
+    Отдельной колонкой — сколько раз критерий останова встал РОВНО на 2. Это
+    подпись предельного цикла: (5-9) для шага d равен 2|sin(d/2)|, значит при
+    d = pi он равен 2, максимуму меры, и упёршийся в такой предел бин не даёт
+    (5-9) выполниться никогда, сколько ни итерируй. Поэтому предел обязан быть
+    строго меньше pi — это не вкус, а свойство самой (5-9).
+    """
+    backend = get_backend("auto")
+    geom = DEMO_GEOMETRY
+    M, N = 256, 96
+    rng = np.random.default_rng(20250915)
+    sc = SY.scene("points_and_clutter", M, N, rng, n_points=12)
+    phi_err = SY.phase_error("mixture", M, 3.0, rng, T_a=geom.T_a)
+    h = SY.range_doppler_from_scene(backend, sc.image, phi_err)
+    coef = A.linearisation_coefficients(geom)
+    x_p, y_p = A.block_half_sizes(coef, geom)
+    m_p, n_p = A.block_sample_sizes(x_p, y_p, geom)
+    M_k, N_k, q = A.block_counts(M, N, m_p, n_p)
+    blocks = A.block_grid(M, N, M_k, N_k, geom)
+    g_scene = A.scene_image(backend, h)
+    prepared = [
+        (A.block_data(backend, g_scene, b), b.shape[0],
+         truth_on_block_grid(phi_err, b.shape[0]))
+        for b in blocks
+    ]
+
+    rows = []
+    for step_max in (math.pi, 1.5, 1.0, 0.5, 0.3, 0.1, 0.05, 0.02):
+        converged, iterations, residuals, pinned = 0, [], [], 0
+        for h_block, m_b, truth in prepared:
+            r = C.iterate_block(backend, h_block, np.zeros(m_b),
+                                mu=MU_MEASURED, step_max=step_max)
+            converged += int(r.converged)
+            iterations.append(r.n_iterations)
+            residuals.append(phase_residual_rms(truth, r.phi))
+            pinned += sum(1 for c in r.criterion_history if c > 1.999)
+        rows.append({
+            "step_max_rad": step_max,
+            "is_pi": step_max == math.pi,
+            "converged_blocks": converged,
+            "blocks": len(prepared),
+            "mean_iterations": float(np.mean(iterations)),
+            "mean_residual_rms_rad": float(np.mean(residuals)),
+            "criterion_pinned_at_two": pinned,
+        })
+    return rows
+
+
 def experiment_edge_cases() -> list[dict]:
     """§7.5 задания: края. M не степень двойки; очень короткий блок; один блок
     на весь кадр (N_k = 1, разбиение чисто азимутальное, §3.7 документа);
@@ -443,14 +548,17 @@ def experiment_edge_cases() -> list[dict]:
         phi_err = SY.phase_error("quadratic", M_total, 3.0, rng)
         h = SY.range_doppler_from_scene(backend, sc.image, phi_err)
         h_block = A.block_data(backend, A.scene_image(backend, h), smallest)
-        result = C.iterate_block(backend, h_block, np.zeros(M_total), mu=MU_MEASURED)
+        m_b = smallest.shape[0]  # §5: длина (5-3) — размер блока, а не сцены
+        result = C.iterate_block(backend, h_block, np.zeros(m_b), mu=MU_MEASURED)
         rows.append({
             "case": f"обрезанный блок q_k={smallest.q_k}: {smallest.shape[0]} бинов "
                     f"против {nominal} у номинального (M={M_total}, M_k={M_k})",
             "iterations": result.n_iterations,
             "converged": result.converged,
             "stop_reason": result.stop_reason,
-            "residual_rms_rad": phase_residual_rms(phi_err, result.phi),
+            "residual_rms_rad": phase_residual_rms(
+                truth_on_block_grid(phi_err, m_b), result.phi
+            ),
             "coverage_exact": sum(b.shape[0] * b.shape[1] for b in blocks)
             == M_total * 48,
         })
@@ -695,7 +803,8 @@ def experiment_block_criterion() -> dict:
 
 
 def experiment_full_run(
-    M: int = 256, N: int = 96, seed: int = 20250915, eta_offset: bool = True
+    M: int = 256, N: int = 96, seed: int = 20250915, eta_offset: bool = True,
+    scene_transform: bool = False,
 ) -> dict:
     """§10.4 задания: полный прогон A->B->C->D на синтетике.
 
@@ -707,6 +816,10 @@ def experiment_full_run(
     НЕ как альтернативную реализацию, а как ЗАМЕР его цены: см.
     experiment_eta_term и §8 документа, расхождение пятое. Рабочая форма
     основного текста (eta_offset=True) — то, что считается по умолчанию.
+
+    scene_transform=True берёт (5-3) длиной во всю сцену вместо длины блока —
+    тоже ЗАМЕР, а не вторая реализация: см. experiment_block_transform. По
+    умолчанию делается так, как написано в §5: «далее M, N — размеры блока».
     """
     geom = DEMO_GEOMETRY
     backend = get_backend("auto")
@@ -722,10 +835,8 @@ def experiment_full_run(
     M_k, N_k, q = A.block_counts(M, N, m_p, n_p)
     blocks = A.block_grid(M, N, M_k, N_k, geom)
 
-    # --- этап B: коэффициенты общие для всех блоков, считаются один раз ---
+    # --- этап B: D_x, D_y общие для всех блоков, считаются один раз ---
     D_x, D_y = B.spatially_variant_quadratic_coefficients(geom, coef)
-    f_a_full = B.azimuth_frequency_axis(M, geom.T_a)
-    eps_reference = B.phase_model(D_x, D_y, x_p, y_p, f_a_full)
 
     # Блок — участок СЦЕНЫ (§3.3 документа), поэтому изображение строится один
     # раз на всю сцену, а плитки вырезаются из него.
@@ -735,8 +846,22 @@ def experiment_full_run(
     images: dict[int, object] = {}
     images_before: dict[int, object] = {}
     for block in blocks:
-        h_block = A.block_data(backend, g_scene, block)
-        M_block = M  # ось доплера полная: поправка ищется на всей апертуре
+        if scene_transform:  # замер другого прочтения, см. experiment_block_transform
+            окно = backend.xp.zeros_like(g_scene)
+            окно[block.m_start : block.m_stop, block.n_start : block.n_stop] = g_scene[
+                block.m_start : block.m_stop, block.n_start : block.n_stop
+            ]
+            h_block = (backend.xp.fft.ifft(окно, axis=0) / backend.alpha)[
+                :, block.n_start : block.n_stop
+            ]
+            M_block = M
+        else:
+            h_block = A.block_data(backend, g_scene, block)
+            M_block = block.m_stop - block.m_start  # §5: «M, N — размеры блока»
+
+        # eps считается на сетке ЭТОГО блока: длина у блока, полоса у радара.
+        f_a_block = B.azimuth_frequency_axis(M_block, geom.T_a, M)
+        eps_reference = B.phase_model(D_x, D_y, x_p, y_p, f_a_block)
 
         # (5-29),(5-30): eta и phi^(0). eps берётся в опорной точке, той же,
         # что в знаменателе (5-29) — см. stage_b_initial.initial_phase.
@@ -748,12 +873,20 @@ def experiment_full_run(
         phi_0 = B.initial_phase(eta, eps_reference)
 
         result = C.iterate_block(backend, h_block, phi_0, mu=MU_MEASURED)
-        полное = D.block_image(backend, h_block, result.phi)
-        images[block.q_k] = полное[block.m_start : block.m_stop]
-        полное0 = D.block_image(backend, h_block, np.zeros(M_block))
-        images_before[block.q_k] = полное0[block.m_start : block.m_stop]
+        плитка = D.block_image(backend, h_block, result.phi)
+        плитка0 = D.block_image(backend, h_block, np.zeros(M_block))
+        leak = 0.0  # у блочного (5-3) энергии некуда деться: свёртка круговая
+        if scene_transform:  # изображение вышло во всю сцену, берётся полоса блока
+            мощность = np.abs(backend.to_numpy(плитка)) ** 2
+            leak = 1.0 - float(
+                мощность[block.m_start : block.m_stop].sum() / мощность.sum()
+            )
+            плитка = плитка[block.m_start : block.m_stop]
+            плитка0 = плитка0[block.m_start : block.m_stop]
+        images[block.q_k] = плитка
+        images_before[block.q_k] = плитка0
 
-        truth_block = phi_err
+        truth_block = truth_on_block_grid(phi_err, M_block)
         per_block.append({
             "q_k": block.q_k, "m_k": block.m_k, "n_k": block.n_k,
             "shape": block.shape,
@@ -767,6 +900,7 @@ def experiment_full_run(
             "residual_rms_rad": phase_residual_rms(truth_block, result.phi),
             "initial_rms_rad": phase_residual_rms(truth_block, phi_0),
             "frozen_bins_total": int(sum(result.frozen_bins_history)),
+            "leak_fraction": leak,
             "_history": result.normalised_entropy_history,
             "_criterion": result.criterion_history,
         })
@@ -813,6 +947,49 @@ def experiment_eta_term() -> dict:
             "q": run["q"],
             "mean_residual_rms_rad": run["mean_residual_rms_rad"],
         }
+    return rows
+
+
+def experiment_block_transform() -> dict:
+    """§5 документа: «далее M, N — размеры блока, h(k,n) — его данные».
+
+    Сколько бинов у преобразования (5-3) в блоке — вопрос не праздный, и
+    книга отвечает на него дважды по-разному. §4.5 и блок-схема §7 называют
+    phi^(0) «вектором длины M», где M — размер сцены; §5, открывая этап C,
+    объявляет M размером блока. В список §8 книги это не попало — расхождение
+    седьмое, найдено при разборе.
+
+    Реализовано второе — так, как написано у (5-3): длина преобразования есть
+    длина суммы по k, то есть размер блока. Чего это стоит, сказано ЗАМЕРОМ:
+    полный прогон считается дважды, блочным преобразованием и сценным.
+
+    Сравнение идёт по ГОТОВОЙ картинке (image_sharpness), потому что остаток
+    фазы у двух способов живёт на разных сетках и прямо не сопоставим.
+
+    Два довода в пользу блочного, помимо буквы книги, тоже замеряются здесь:
+    энергия за границу блока не выходит вовсе (свёртка круговая), и итерация
+    дешевле. У сценного и то, и другое хуже — утечка ненулевая, БПФ длиннее.
+    """
+    backend = get_backend("auto")
+    rows: dict[str, dict] = {}
+    эталон = None
+    for label, flag in (("блочное ПФ (как в §5)", False), ("сценное ПФ", True)):
+        run = experiment_full_run(scene_transform=flag)
+        эталон = run["_scene"].image
+        rows[label] = {
+            "transform_length": "M сцены" if flag else "m_b блока",
+            "converged_blocks": run["converged_blocks"],
+            "mean_residual_rms_rad": run["mean_residual_rms_rad"],
+            "leak_percent": 100.0 * float(
+                np.mean([b["leak_fraction"] for b in run["per_block"]])
+            ),
+            **image_sharpness(backend, run["_image_after"]),
+        }
+    rows["идеальная сцена"] = {
+        "transform_length": "—", "converged_blocks": None,
+        "mean_residual_rms_rad": 0.0, "leak_percent": 0.0,
+        **image_sharpness(backend, эталон),
+    }
     return rows
 
 

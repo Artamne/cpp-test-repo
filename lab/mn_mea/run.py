@@ -213,6 +213,20 @@ def main(out_dir: pathlib.Path) -> int:
     say(f"* политика 'raise' на той же сцене даёт отказ с причиной: "
         f"`{(curvature['refusal_message'] or 'отказа не случилось')[:160]}`")
     say()
+    say("Предел шага выбран ЗАМЕРОМ, а не рассуждением. Колонка «критерий = 2» "
+        "это подпись предельного цикла: (5-9) для шага d равен 2|sin(d/2)|, "
+        "значит при d = pi он равен 2 — максимуму меры, — и упёршийся в такой "
+        "предел бин не даёт (5-9) выполниться никогда.")
+    say()
+    say("| предел шага, рад | сошлось блоков | итераций (ср.) | остаток (ср.), рад | критерий = 2, раз |")
+    say("|---:|---|---:|---:|---:|")
+    for row in V.experiment_step_limit():
+        имя = "pi (прежнее, НЕВЕРНОЕ)" if row["is_pi"] else f"{row['step_max_rad']:g}"
+        взято = " ← взято" if row["step_max_rad"] == C.STEP_MAX_RAD else ""
+        say(f"| {имя}{взято} | {row['converged_blocks']}/{row['blocks']} | "
+            f"{row['mean_iterations']:.1f} | {row['mean_residual_rms_rad']:.4f} | "
+            f"{row['criterion_pinned_at_two']} |")
+    say()
     say("### Решение №3: нормировка ПФ")
     normalisation = V.experiment_normalisation()
     say()
@@ -299,6 +313,25 @@ def main(out_dir: pathlib.Path) -> int:
         say(f"| {label} | [{row['eta_min']:.2f}, {row['eta_max']:.2f}] | "
             f"{row['phi0_rms_max_rad']:.2f} | {row['mean_initial_rms_rad']:.3f} | "
             f"{row['mean_iterations']:.1f} | {row['converged_blocks']}/{row['q']} |")
+    say()
+
+    say("* **длина преобразования (5-3)** — расхождение книги СЕДЬМОЕ, в её "
+        "собственный список §8 не попавшее. §4.5 и блок-схема §7 называют "
+        "phi(0) «вектором длины M», где M — размер сцены; §5, открывая этап C, "
+        "объявляет «далее M, N — размеры блока». Взято второе: длина суммы по "
+        "k в (5-3) и есть длина преобразования. Чего это стоит:")
+    say()
+    say("| способ | длина (5-3) | сошлось | остаток, рад | S (5-6) | контраст | пик | энергии вне блока |")
+    say("|---|---|---|---:|---:|---:|---:|---:|")
+    for label, row in V.experiment_block_transform().items():
+        сош = "—" if row["converged_blocks"] is None else f"{row['converged_blocks']}/12"
+        say(f"| {label} | {row['transform_length']} | {сош} | "
+            f"{row['mean_residual_rms_rad']:.4f} | {row['S']:.4f} | "
+            f"{row['contrast']:.2f} | {row['peak']:.1f} | {row['leak_percent']:.1f} % |")
+    say()
+    say("Блочное преобразование круговое ВНУТРИ плитки, поэтому энергия за "
+        "границу блока не выходит вовсе. У сценного она выходит в занулённую "
+        "область — на чужую землю, — и попадает в энтропию (5-5) этого блока.")
     say()
 
     # ---------------------------------------------------------------- §7.5
