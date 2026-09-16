@@ -28,7 +28,8 @@
     experiment_block_transform       §5           длина (5-3): блок или сцена
     experiment_image_shift           решение №5   снятие сдвига блока
     experiment_block_window          решение №6   перехлёст окна и нули
-    experiment_space_invariance                   чего стенд НЕ проверяет
+    experiment_space_invariance                   чего НЕ проверяет неизменчивый стенд
+    experiment_space_variant_run     §3           A->B->C->D на ИЗМЕНЧИВОЙ ошибке
     experiment_method_summary                     сводка: что дал каждый способ
     experiment_full_run              §10.4        A->B->C->D целиком
 """
@@ -1032,6 +1033,109 @@ def experiment_image_shift(
             "mean_entropy": entropy_shift,
         }
     return rows
+
+
+def _pairwise_spread(truths: list[np.ndarray]) -> float:
+    """Наибольшее СКО разности между истинами двух блоков, после снятия
+    полинома первой степени из обеих. Это и есть та изменчивость, которую
+    один вектор фазы на всю сцену исправить не в состоянии."""
+    cleaned = [remove_first_degree_polynomial(t) for t in truths]
+    if len(cleaned) < 2:
+        return 0.0
+    return max(
+        float(np.sqrt(np.mean((a - b) ** 2)))
+        for i, a in enumerate(cleaned) for b in cleaned[i + 1:]
+    )
+
+
+def experiment_space_variant_run(
+    M: int = 256, N: int = 96, seed: int = 20250915, blocks_override: int | None = None
+) -> dict:
+    """Полный прогон A->B->C->D на ПРОСТРАНСТВЕННО ИЗМЕНЧИВОЙ ошибке.
+
+    Отличие от experiment_full_run одно, но решающее: ошибка вносится не
+    одним вектором на всю сцену, а по модели книги (5-27) — своя для каждой
+    точки местности, eps(x,y) = (D_x x + D_y y) f_a^2, с теми же D_x, D_y,
+    что считает этап B по геометрии. Только на таких данных этапы A и B
+    вообще имеют смысл: одним вектором фазы сцену уже не исправить.
+
+    blocks_override=1 считает всю сцену ОДНИМ блоком — не как предложение
+    так делать, а как замер: при изменчивой ошибке один блок обязан
+    ПРОИГРАТЬ разбиению. Если не проигрывает, значит изменчивость внесена
+    слабее, чем размер блока по (5-20), и стенд опять меряет не то.
+
+    Истина у каждого блока СВОЯ: eps в центре его участка местности. Это же
+    и есть то, что этап B пытается угадать через eta * eps (5-29)/(5-30), —
+    сравнение получается прямым.
+    """
+    geom = DEMO_GEOMETRY
+    backend = get_backend("auto")
+    rng = np.random.default_rng(seed)
+    sc = SY.scene("points_and_clutter", M, N, rng, n_points=12)
+
+    coef = A.linearisation_coefficients(geom)
+    x_p, y_p = A.block_half_sizes(coef, geom)
+    m_p, n_p = A.block_sample_sizes(x_p, y_p, geom)
+    M_k, N_k, q = A.block_counts(M, N, m_p, n_p)
+    if blocks_override == 1:
+        M_k, N_k, q = 1, 1, 1
+    blocks = A.block_grid(M, N, M_k, N_k, geom)
+    D_x, D_y = B.spatially_variant_quadratic_coefficients(geom, coef)
+
+    # карта изменчивости по земле: x — азимут, y — дальность, от центра сцены
+    x_axis = (np.arange(M) - M / 2.0) * geom.r_a
+    y_axis = (np.arange(N) - N / 2.0) * geom.r_b
+    s_map = SY.variance_scale(D_x, D_y, x_axis[:, None], y_axis[None, :])
+    f_a_scene = B.azimuth_frequency_axis(M, geom.T_a, M)
+    h = SY.range_doppler_spatially_variant(backend, sc.image, f_a_scene, s_map)
+
+    g_scene = A.scene_image(backend, h)
+    per_block, images, truths = [], {}, []
+    for block in blocks:
+        data = A.block_data(backend, g_scene, block)
+        L = data.h.shape[0]
+        f_a = B.azimuth_frequency_axis(L, geom.T_a, M)
+        eps_reference = B.phase_model(D_x, D_y, x_p, y_p, f_a)
+        eta = B.block_scale_factor(
+            D_x, D_y, block.x_centre, block.y_centre, x_p, y_p, q, block.q_k
+        )
+        phi_0 = B.initial_phase(eta, eps_reference)
+        result = C.iterate_block(backend, data.h, phi_0, mu=MU_MEASURED)
+        phi_final = D.remove_image_shift(backend, result.phi)
+        tile = D.block_image(backend, data.h, phi_final)
+        images[block.q_k] = tile[data.core_start : data.core_stop]
+
+        # истина этого блока: (5-27) в центре его участка местности
+        truth = SY.spatially_variant_truth(
+            SY.variance_scale(D_x, D_y, block.x_centre, block.y_centre), f_a
+        )
+        # для разброса между блоками истина берётся на ОБЩЕЙ сетке сцены:
+        # блоки бывают разного размера, и их собственные сетки несравнимы
+        truths.append(SY.spatially_variant_truth(
+            SY.variance_scale(D_x, D_y, block.x_centre, block.y_centre), f_a_scene
+        ))
+        per_block.append({
+            "q_k": block.q_k,
+            "converged": result.converged,
+            "iterations": result.n_iterations,
+            "residual_rms_rad": phase_residual_rms(truth, phi_final),
+            "initial_rms_rad": phase_residual_rms(truth, phi_0),
+            "truth_rms_rad": float(np.sqrt(np.mean(
+                remove_first_degree_polynomial(truth) ** 2))),
+        })
+
+    assembled = backend.to_numpy(D.assemble(backend, images, blocks, M, N))
+    return {
+        "q": q, "M_k": M_k, "N_k": N_k,
+        "per_block": per_block,
+        "converged_blocks": sum(1 for b in per_block if b["converged"]),
+        "mean_residual_rms_rad": float(np.mean([b["residual_rms_rad"] for b in per_block])),
+        "mean_initial_rms_rad": float(np.mean([b["initial_rms_rad"] for b in per_block])),
+        "variance_span_rad": float(np.ptp([b["truth_rms_rad"] for b in per_block])),
+        "pairwise_truth_spread_rad": _pairwise_spread(truths),
+        **image_sharpness(backend, assembled),
+        "_ideal": image_sharpness(backend, sc.image),
+    }
 
 
 def experiment_space_invariance(seed: int = 20250915) -> dict:

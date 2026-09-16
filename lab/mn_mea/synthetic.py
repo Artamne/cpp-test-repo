@@ -6,9 +6,12 @@
 
 Порядок функций — порядок выполнения:
 
-    scene                   g_true: какая сцена   (§7.4)
-    phase_error             phi_err: какая ошибка (§7.3)
-    range_doppler_from_data h(k,n) с внесённой ошибкой
+    scene                          g_true: какая сцена   (§7.4)
+    phase_error                    phi_err: какая ошибка (§7.3), ОДНА на сцену
+    range_doppler_from_scene       h(k,n) с внесённой ошибкой
+    variance_scale                 s(m,n) = D_x x + D_y y — изменчивость по земле
+    spatially_variant_truth        истина для точки местности
+    range_doppler_spatially_variant  h(k,n) с ИЗМЕНЧИВОЙ ошибкой
 
 Связь истины и оценки. Данные строятся так, чтобы (5-3) при phi = 0 давало
 расфокусированное изображение, а при phi = phi_err — ровно g_true:
@@ -19,6 +22,20 @@
                                              постоянной и линейной по k)
 
 Значит ИСТИНА, с которой сравнивается результат этапа C, — это phi_err.
+
+ДВА ВИДА СТЕНДА, и путать их нельзя.
+
+  Неизменчивый. phase_error даёт ОДИН вектор на всю сцену. Годится для этапа
+  C в одиночку (§7.1): итерации, сходимость, стоимость — всё это от места на
+  местности не зависит. Но этапы A и B на таких данных НЕ ПРОВЕРЯЮТСЯ: они
+  существуют ради пространственной изменчивости, а её здесь нет, и разбиение
+  на блоки может только навредить. Замер этому — validate.experiment_space_invariance.
+
+  Изменчивый. range_doppler_spatially_variant вносит ошибку по модели самой
+  книги (5-27): eps(x,y) = (D_x x + D_y y) f_a^2, то есть СВОЮ для каждой
+  точки местности. Тогда одним вектором фазы всю сцену не исправить, деление
+  на блоки становится осмысленным, и этапы A и B получают то, что должны
+  чинить. Истина для блока — spatially_variant_truth в его центре.
 """
 
 from __future__ import annotations
@@ -145,6 +162,81 @@ def _smooth_deviation(u: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     for harmonic in JITTER_HARMONICS:
         deviation += rng.normal() * np.sin(np.pi * harmonic * (u + 1.0) / 2.0 + 2 * np.pi * rng.random())
     return deviation / deviation.std()
+
+
+def variance_scale(D_x: float, D_y: float, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Множитель изменчивости s = D_x x + D_y y из (5-27), в точке местности.
+
+    Принимает D_x, D_y этапа B и координаты относительно центра сцены в
+    метрах; возвращает скаляр или массив той же формы.
+
+    Вся пространственная изменчивость квадратичной фазы книги входит через
+    это одно число: (5-27) есть s * f_a^2. Поэтому и вносить её достаточно
+    так же — иначе стенд проверял бы не ту модель, которую реализует этап B.
+    """
+    return D_x * np.asarray(x) + D_y * np.asarray(y)
+
+
+def spatially_variant_truth(s: float, f_a: np.ndarray) -> np.ndarray:
+    """(5-27) как ИСТИНА стенда: eps = s * f_a^2 для точки местности с
+    множителем s = variance_scale(...).
+
+    Принимает множитель s и ось азимутальных частот; возвращает вектор фазы
+    той же длины, что и f_a.
+
+    Это ровно та функция, которую этап B пытается угадать через eta * eps
+    (5-29)/(5-30). Совпадение модели намеренное: если стенд вносит одно, а
+    этап B описывает другое, то замер скажет не о качестве этапа B, а о
+    разнице двух моделей.
+    """
+    return s * np.asarray(f_a) ** 2
+
+
+def range_doppler_spatially_variant(
+    backend: Backend,
+    g_true: np.ndarray,
+    f_a: np.ndarray,
+    s_map: np.ndarray,
+    phi_common: np.ndarray | None = None,
+) -> np.ndarray:
+    """Данные h(k,n) с ПРОСТРАНСТВЕННО ИЗМЕНЧИВОЙ ошибкой фазы.
+
+    Принимает бэкенд, истинное изображение g_true (M, N), ось частот f_a
+    длины M, карту множителей s_map (M, N) по (5-27) и необязательную общую
+    для всей сцены добавку phi_common длины M; возвращает h(k,n) (M, N).
+
+        h(k,n) = (1/M) sum_m g_true(m,n) e^{+j 2 pi k m / M}
+                                          e^{-j[ s(m,n) f_a(k)^2 + phi_common(k) ]}
+
+    Ядро со знаком ПЛЮС и множитель 1/M — потому что это обращение (5-3), у
+    которой ядро с минусом; при s = 0 сумма обязана совпасть с
+    range_doppler_from_scene отсчёт в отсчёт, и это проверяется замером.
+
+    Почему нельзя проще. Неизменчивую ошибку вносят одним умножением
+    h * e^{-j phi}, потому что она одна на все m. Изменчивая своя у каждого
+    пикселя азимута, а m и k — сопряжённые переменные: домножением в области
+    k такого не сделать. Поэтому сумма берётся честно, отсчёт за отсчётом:
+    каждый рассеиватель вносится со своей поправкой.
+
+    Стоит это M x M на строб дальности — заметно дороже одного БПФ, но это
+    стенд, а не алгоритм, и считается один раз на прогон.
+    """
+    g = backend.to_numpy(g_true)
+    M, N = g.shape
+    f_a = np.asarray(f_a, dtype=np.float64)
+    s_map = np.asarray(s_map, dtype=np.float64)
+    common = np.zeros(M) if phi_common is None else np.asarray(phi_common, dtype=np.float64)
+
+    k = np.arange(M)
+    kernel = np.exp(2j * np.pi * np.outer(k, np.arange(M)) / M)  # обращение (5-3)
+    f2 = (f_a ** 2)[:, None]                                      # (M, 1) по k
+    out = np.empty((M, N), dtype=np.complex128)
+    for n in range(N):
+        # e^{-j s(m,n) f_a(k)^2}: своя поправка каждому азимутальному отсчёту
+        phase = np.exp(-1j * f2 * s_map[:, n][None, :])
+        out[:, n] = (kernel * phase) @ g[:, n]
+    out *= np.exp(-1j * common)[:, None]
+    return backend.asarray(out / (backend.alpha * M))
 
 
 def range_doppler_from_scene(
