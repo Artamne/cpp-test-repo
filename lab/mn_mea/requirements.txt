@@ -1,0 +1,11 @@
+# Всё, что нужно проекту сверх стандартной библиотеки. Больше ничего.
+#
+#     python3 -m venv .venv
+#     source .venv/bin/activate
+#     pip install -r lab/mn_mea/requirements.txt
+#
+# Видеокарта необязательна. Если она есть и нужен счёт на ней — доставьте
+# cupy под свою версию CUDA (например cupy-cuda12x); backend.py подхватит
+# его сам, остальной код не меняется.
+numpy>=1.24
+matplotlib>=3.6

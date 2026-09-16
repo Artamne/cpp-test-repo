@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 lab/mn_mea/look/
+.venv/
+venv/
+env/
