@@ -16,6 +16,19 @@
 нормированной энтропией (5-6) и контрастом. Энтропия при этом не является
 независимой проверкой: алгоритм её и минимизирует, она обязана упасть.
 Независимо смотрит контраст, и он же на графиках — глазами.
+
+Объективно сверить можно НАРЕЗКУ: если prepare_slice.py положил в паспорт
+раздел ozhidaemaya_narezka, размер блока и число блоков сличаются с ним
+(grid_agreement). Это единственная проверка, у которой тут есть ответ.
+
+Порядок функций — порядок выполнения:
+
+    read_slice          прочитать h_srez.npy и meta.json
+    geometry_from_meta  Geometry из паспорта, разрешение отдельно от шага
+    focus               блоки, этап C из нуля, этап D
+    grid_agreement      сверка нарезки с ожиданием паспорта
+    contrast            число, которое алгоритм НЕ минимизирует
+    main                всё вместе, с печатью и картинкой
 """
 
 from __future__ import annotations
@@ -84,10 +97,10 @@ def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
     """
     backend = get_backend("auto")
     M, N = h.shape
+    coefficients = A.linearisation_coefficients(geom)
+    x_p, y_p = A.block_half_sizes(coefficients, geom)
+    m_p, n_p = A.block_sample_sizes(x_p, y_p, geom)
     if grid is None:
-        coefficients = A.linearisation_coefficients(geom)
-        x_p, y_p = A.block_half_sizes(coefficients, geom)
-        m_p, n_p = A.block_sample_sizes(x_p, y_p, geom)
         M_k, N_k, _ = A.block_counts(M, N, m_p, n_p)
     else:
         M_k, N_k = grid
@@ -118,10 +131,47 @@ def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
         })
     return {
         "blocks": blocks, "M_k": M_k, "N_k": N_k, "per_block": rows,
+        "m_p": m_p, "n_p": n_p,
         "image_before": backend.to_numpy(D.assemble(backend, before, blocks, M, N)),
         "image_after": backend.to_numpy(D.assemble(backend, after, blocks, M, N)),
         "backend": backend,
     }
+
+
+def grid_agreement(meta: dict, m_p: float, n_p: float,
+                   N_k: int | None) -> list[str]:
+    """Сверка нарезки с тем, чего ждёт паспорт.
+
+    Принимает meta.json, размеры блока в отсчётах и число блоков по дальности
+    (None, если сетку задали рукой — тогда сверять её не с чем); возвращает
+    строки для печати, пустой список — если в паспорте ожидания нет.
+
+    Зачем. prepare_slice.py кладёт в паспорт раздел ozhidaemaya_narezka: каким
+    размер блока по азимуту ДОЛЖЕН выйти, и каким он выходил, пока код путал
+    разрешение с шагом изображения. Раздел написан ловушкой ровно на эту
+    путаницу. На записи истины нет, проверить фазу нечем — а нарезку эта
+    сверка проверяет, и она единственная.
+    """
+    expected = meta.get("ozhidaemaya_narezka")
+    if not expected:
+        return []
+    lines = []
+    want_m = expected.get("m_p_pravilnyy")
+    if want_m is not None:
+        agrees = abs(m_p - want_m) <= 0.01 * max(abs(want_m), 1.0)
+        lines.append(f"  отсчётов в блоке по азимуту: код {m_p:.2f}, "
+                     f"паспорт ждёт {want_m:.2f} — "
+                     f"{'сходится' if agrees else 'НЕ СХОДИТСЯ'}")
+        wrong = expected.get("m_p_kak_schitaet_kod")
+        if wrong is not None and not agrees:
+            lines.append(f"  (если вышло около {wrong:.2f} — разрешение и шаг "
+                         f"опять слиплись в одно число, см. Geometry.r_a_step)")
+    want_n = expected.get("N_k_ozhidaemoe")
+    if want_n is not None and N_k is not None:
+        lines.append(f"  блоков по дальности: код {N_k}, паспорт ждёт {want_n} — "
+                     f"{'сходится' if N_k == want_n else 'НЕ СХОДИТСЯ'} "
+                     f"(при n_p = {n_p:.0f} отсчётов на блок)")
+    return lines
 
 
 def contrast(image: np.ndarray) -> float:
@@ -164,6 +214,9 @@ def main() -> int:
     run = focus(h, geom, grid)
     print(f"\nсетка блоков {run['M_k']}x{run['N_k']}, "
           f"начальная фаза нулевая (этап B не делается)")
+    for line in grid_agreement(meta, run["m_p"], run["n_p"],
+                               None if grid else run["N_k"]):
+        print(line)
     print(f"\n{'блок':>5}{'размер':>10}{'итер':>6}{'сошлось':>9}"
           f"{'S до':>9}{'S после':>9}{'заморожено':>12}")
     for row in run["per_block"]:
