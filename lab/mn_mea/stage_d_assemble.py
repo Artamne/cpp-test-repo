@@ -38,12 +38,12 @@ def assemble(backend: Backend, images: dict[int, object], blocks: list[Block], M
     Принимает бэкенд, словарь {q_k: изображение блока}, список блоков этапа A
     и размеры сцены; возвращает собранное изображение (M, N).
 
-    Блоки нарезаны из массива h(k,n) плитками M_k x N_k (см. block_grid), и
+    Блоки нарезаны из ИЗОБРАЖЕНИЯ сцены плитками M_k x N_k (см. block_grid), и
     сборка — это обратная укладка тех же плиток. Каждая плитка встаёт по
-    своим (k_start:k_stop, n_start:n_stop), то есть ровно туда, откуда была
+    своим (m_start:m_stop, n_start:n_stop), то есть ровно туда, откуда была
     взята, а её сквозной номер q_k = m_k + M_k(n_k - 1) — это (5-26).
     """
     out = backend.xp.zeros((M, N), dtype=backend.complex_dtype)
     for block in blocks:
-        out[block.k_start : block.k_stop, block.n_start : block.n_stop] = images[block.q_k]
+        out[block.m_start : block.m_stop, block.n_start : block.n_stop] = images[block.q_k]
     return out

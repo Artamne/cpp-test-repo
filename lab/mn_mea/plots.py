@@ -186,8 +186,8 @@ def plot_block_map(full_run: dict, path: pathlib.Path) -> pathlib.Path:
     """График 6 §8: карта блоков на сцене с номерами по (5-26) — чтобы видеть,
     что разбиение легло так, как задумано.
 
-    Ось азимута здесь — ось доплеровских бинов k массива h(k,n): этап A режет
-    именно массив h (см. README, «Как читается нарезка на блоки»).
+    Ось азимута здесь — ось пикселей изображения m: этап A режет СЦЕНУ на
+    участки местности (§3.3 документа).
     """
     image_db = _decibels(full_run["_image_after"])
     fig, ax = plt.subplots(figsize=(8, 8))
@@ -196,14 +196,14 @@ def plot_block_map(full_run: dict, path: pathlib.Path) -> pathlib.Path:
               interpolation="nearest")
     for block in full_run["blocks"]:
         ax.add_patch(plt.Rectangle(
-            (block.n_start - 0.5, block.k_start - 0.5),
-            block.n_stop - block.n_start, block.k_stop - block.k_start,
+            (block.n_start - 0.5, block.m_start - 0.5),
+            block.n_stop - block.n_start, block.m_stop - block.m_start,
             fill=False, edgecolor="deepskyblue", linewidth=1.4))
-        ax.text((block.n_start + block.n_stop) / 2, (block.k_start + block.k_stop) / 2,
+        ax.text((block.n_start + block.n_stop) / 2, (block.m_start + block.m_stop) / 2,
                 f"$q_k$={block.q_k}\n$m_k$={block.m_k}, $n_k$={block.n_k}",
                 color="yellow", ha="center", va="center", fontsize=8)
     ax.set_xlabel("строб дальности n")
-    ax.set_ylabel("доплеровский бин k (ось азимутальной нарезки)")
+    ax.set_ylabel("азимутальный пиксель m")
     ax.set_title(
         f"6. Карта блоков, нумерация по (5-26): $q_k = m_k + M_k(n_k-1)$\n"
         f"$M_k$={full_run['M_k']}, $N_k$={full_run['N_k']}, $q$={full_run['q']}; "

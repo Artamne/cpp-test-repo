@@ -442,19 +442,15 @@ def experiment_edge_cases() -> list[dict]:
         sc = SY.scene("points_and_clutter", M_total, 48, rng)
         phi_err = SY.phase_error("quadratic", M_total, 3.0, rng)
         h = SY.range_doppler_from_scene(backend, sc.image, phi_err)
-        h_block = h[smallest.k_start : smallest.k_stop, smallest.n_start : smallest.n_stop]
-        result = C.iterate_block(
-            backend, h_block, np.zeros(smallest.shape[0]), mu=MU_MEASURED
-        )
+        h_block = A.block_data(backend, A.scene_image(backend, h), smallest)
+        result = C.iterate_block(backend, h_block, np.zeros(M_total), mu=MU_MEASURED)
         rows.append({
             "case": f"обрезанный блок q_k={smallest.q_k}: {smallest.shape[0]} бинов "
                     f"против {nominal} у номинального (M={M_total}, M_k={M_k})",
             "iterations": result.n_iterations,
             "converged": result.converged,
             "stop_reason": result.stop_reason,
-            "residual_rms_rad": phase_residual_rms(
-                phi_err[smallest.k_start : smallest.k_stop], result.phi
-            ),
+            "residual_rms_rad": phase_residual_rms(phi_err, result.phi),
             "coverage_exact": sum(b.shape[0] * b.shape[1] for b in blocks)
             == M_total * 48,
         })
@@ -731,12 +727,16 @@ def experiment_full_run(
     f_a_full = B.azimuth_frequency_axis(M, geom.T_a)
     eps_reference = B.phase_model(D_x, D_y, x_p, y_p, f_a_full)
 
+    # Блок — участок СЦЕНЫ (§3.3 документа), поэтому изображение строится один
+    # раз на всю сцену, а плитки вырезаются из него.
+    g_scene = A.scene_image(backend, h)
+
     per_block = []
     images: dict[int, object] = {}
     images_before: dict[int, object] = {}
     for block in blocks:
-        h_block = h[block.k_start : block.k_stop, block.n_start : block.n_stop]
-        M_block = block.k_stop - block.k_start
+        h_block = A.block_data(backend, g_scene, block)
+        M_block = M  # ось доплера полная: поправка ищется на всей апертуре
 
         # (5-29),(5-30): eta и phi^(0). eps берётся в опорной точке, той же,
         # что в знаменателе (5-29) — см. stage_b_initial.initial_phase.
@@ -745,13 +745,15 @@ def experiment_full_run(
         )
         if not eta_offset:  # замер цены расхождения §8, см. experiment_eta_term
             eta += (q - block.q_k) / 2.0
-        phi_0 = B.initial_phase(eta, eps_reference[block.k_start : block.k_stop])
+        phi_0 = B.initial_phase(eta, eps_reference)
 
         result = C.iterate_block(backend, h_block, phi_0, mu=MU_MEASURED)
-        images[block.q_k] = D.block_image(backend, h_block, result.phi)
-        images_before[block.q_k] = D.block_image(backend, h_block, np.zeros(M_block))
+        полное = D.block_image(backend, h_block, result.phi)
+        images[block.q_k] = полное[block.m_start : block.m_stop]
+        полное0 = D.block_image(backend, h_block, np.zeros(M_block))
+        images_before[block.q_k] = полное0[block.m_start : block.m_stop]
 
-        truth_block = phi_err[block.k_start : block.k_stop]
+        truth_block = phi_err
         per_block.append({
             "q_k": block.q_k, "m_k": block.m_k, "n_k": block.n_k,
             "shape": block.shape,
