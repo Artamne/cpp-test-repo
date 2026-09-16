@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -139,24 +140,61 @@ def gpu_status() -> tuple[bool, str]:
 
     Возвращает (годится, причина словами).
 
-    Мало проверить, что cupy импортируется. Импорт может пройти, а первое же
-    ядро — не собраться: у сборки cupy и установленного CUDA Toolkit разные
-    наборы заголовков, и NVRTC отказывает уже посреди работы. Поэтому здесь
-    считается крошечное БПФ со сравнением — ровно то, на чём стоит (5-3) и
-    ровно та связка, на которой отказ и вылезает.
+    Мало проверить, что cupy импортируется, и мало посчитать одно БПФ. cupy
+    собирает ядра на лету, каждое своё, и отказ NVRTC приходит на ТОМ ядре,
+    которое понадобилось, — а не на первом попавшемся. Поэтому здесь
+    прогоняется уменьшенная копия настоящей итерации §5.8: те же действия над
+    теми же типами, что и в stage_c_iterate, только на массиве 8 x 4.
+
+    Список действий не выдуман, а снят с самого алгоритма: два БПФ (5-3) и
+    (5-14), умножение на комплексную экспоненту с broadcasting, abs, exp, log,
+    maximum, clip, where, conj, ones_like, zeros_like, astype, сравнение и
+    сумма с накоплением в двойной точности. Добавится действие в этап C —
+    добавить его и сюда.
     """
     try:
         xp = importlib.import_module("cupy")
     except Exception as exc:
         return False, f"cupy не установлен или не импортируется: {type(exc).__name__}"
     try:
-        out = xp.abs(xp.fft.fft(xp.arange(4, dtype=xp.complex128)))
-        bool(xp.all(out >= 0))
+        _gpu_smoke_test(xp)
     except Exception as exc:
-        first_line = str(exc).strip().splitlines()[0][:160] if str(exc).strip() else ""
+        text = str(exc).strip()
+        first_line = next((ln for ln in text.splitlines() if "error" in ln.lower()), "")
+        if not first_line:
+            first_line = text.splitlines()[0] if text else ""
         return False, (f"cupy импортируется, но не считает — {type(exc).__name__}"
-                       + (f": {first_line}" if first_line else ""))
+                       + (f": {first_line.strip()[:160]}" if first_line else ""))
     return True, "видеокарта считает"
+
+
+def _gpu_smoke_test(xp) -> None:
+    """Уменьшенная копия итерации §5.8 — всё, что делает этап C, на 8 x 4.
+    Ничего не возвращает; если видеокарта не годится, отсюда летит отказ."""
+    M, N = 8, 4
+    h = xp.asarray(np.arange(M * N, dtype=np.complex128).reshape(M, N) + 1.0)
+    phi = xp.asarray(np.linspace(0.0, 1.0, M, dtype=np.float64))
+
+    h_phi = h * xp.exp(1j * phi)[:, None]          # шаг 1
+    g = xp.fft.fft(h_phi, axis=0)                  # (5-3)
+    P = xp.abs(g) ** 2                             # шаг 3
+    P = xp.maximum(P, xp.asarray(1e-30, dtype=P.dtype))
+    ln_P = xp.log(P)
+    E_g = float(xp.sum(P * ln_P, dtype=np.float64))  # (5-5), накопление float64
+    G = xp.fft.ifft((1.0 + ln_P) * g, axis=0) * M    # (5-14)
+    W = xp.conj(G) * h_phi                           # W = G* h e^{j phi}
+    E_1 = 2.0 * xp.sum(W.imag, axis=1, dtype=np.float64)   # (5-13)
+    E_2 = 2.0 * xp.sum(W.real, axis=1, dtype=np.float64)   # (5-19), укороченно
+
+    bad = E_2 <= 0.0                                 # сравнение
+    n_bad = float(xp.sum(bad.astype(xp.float64), dtype=np.float64))
+    safe = xp.where(bad, xp.ones_like(E_2), E_2)
+    step = xp.clip(xp.where(bad, xp.zeros_like(E_1), -E_1 / safe), -1.0, 1.0)
+    crit = float(xp.max(xp.abs(xp.exp(1j * (phi + step)) - xp.exp(1j * phi))))
+    g32 = g.astype(xp.complex64)                     # одинарная точность тоже
+    float(xp.sum(xp.abs(g32) ** 2, dtype=np.float64))
+    if not (E_g == E_g and n_bad >= 0.0 and crit >= 0.0):
+        raise RuntimeError("видеокарта вернула не-число")
 
 
 def available_backends() -> list[str]:
@@ -176,10 +214,23 @@ def available_backends() -> list[str]:
 
 
 def get_backend(name: str = "auto", alpha: float = FFT_SCALE_ALPHA) -> Backend:
-    """Возвращает бэкенд по имени. 'auto' — видеокарта, если она есть, иначе
-    процессор. Принимает имя и множитель нормировки alpha, возвращает Backend."""
+    """Возвращает бэкенд по имени. 'auto' — видеокарта, если она есть и
+    РАБОТАЕТ, иначе процессор. Принимает имя и множитель нормировки alpha,
+    возвращает Backend.
+
+    Переменная окружения MN_MEA_BACKEND перебивает 'auto'. Это рубильник на
+    случай, когда видеокарта на машине есть, но пользоваться ей нельзя, а
+    трогать код не хочется:
+
+        MN_MEA_BACKEND=numpy python3 run.py
+
+    Явно названный в вызове бэкенд не перебивается ничем: если сказано
+    get_backend('cupy'), значит нужен именно он, и отказ должен быть виден,
+    а не подменён тихой заменой.
+    """
     if name == "auto":
-        name = available_backends()[0]
+        forced = os.environ.get("MN_MEA_BACKEND", "").strip()
+        name = forced if forced else available_backends()[0]
 
     if name.startswith("cupy"):
         xp = importlib.import_module("cupy")
