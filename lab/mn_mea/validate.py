@@ -27,6 +27,7 @@
     experiment_block_criterion       §4           (5-20) выполняется
     experiment_block_transform       §5           длина (5-3): блок или сцена
     experiment_image_shift           решение №5   снятие сдвига блока
+    experiment_block_window          решение №6   перехлёст окна и нули
     experiment_full_run              §10.4        A->B->C->D целиком
 """
 
@@ -513,9 +514,8 @@ def experiment_step_limit() -> list[dict]:
     blocks = A.block_grid(M, N, M_k, N_k, geom)
     g_scene = A.scene_image(backend, h)
     prepared = [
-        (A.block_data(backend, g_scene, b), b.shape[0],
-         truth_on_block_grid(phi_err, b.shape[0]))
-        for b in blocks
+        (data.h, data.h.shape[0], truth_on_block_grid(phi_err, data.h.shape[0]))
+        for data in (A.block_data(backend, g_scene, b) for b in blocks)
     ]
 
     rows = []
@@ -569,9 +569,9 @@ def experiment_edge_cases() -> list[dict]:
         sc = SY.scene("points_and_clutter", M_total, 48, rng)
         phi_err = SY.phase_error("quadratic", M_total, 3.0, rng)
         h = SY.range_doppler_from_scene(backend, sc.image, phi_err)
-        h_block = A.block_data(backend, A.scene_image(backend, h), smallest)
-        m_b = smallest.shape[0]  # §5: длина (5-3) — размер блока, а не сцены
-        result = C.iterate_block(backend, h_block, np.zeros(m_b), mu=MU_MEASURED)
+        data = A.block_data(backend, A.scene_image(backend, h), smallest)
+        m_b = data.h.shape[0]  # §5: длина (5-3) — размер окна блока, не сцены
+        result = C.iterate_block(backend, data.h, np.zeros(m_b), mu=MU_MEASURED)
         rows.append({
             "case": f"обрезанный блок q_k={smallest.q_k}: {smallest.shape[0]} бинов "
                     f"против {nominal} у номинального (M={M_total}, M_k={M_k})",
@@ -880,9 +880,12 @@ def experiment_full_run(
                 :, block.n_start : block.n_stop
             ]
             M_block = M
+            core = (block.m_start, block.m_stop)
         else:
-            h_block = A.block_data(backend, g_scene, block)
-            M_block = block.m_stop - block.m_start  # §5: «M, N — размеры блока»
+            data = A.block_data(backend, g_scene, block)
+            h_block = data.h
+            M_block = h_block.shape[0]  # §5: «M, N — размеры блока», плюс окно №6
+            core = (data.core_start, data.core_stop)
 
         # eps считается на сетке ЭТОГО блока: длина у блока, полоса у радара.
         f_a_block = B.azimuth_frequency_axis(M_block, geom.T_a, M)
@@ -905,13 +908,11 @@ def experiment_full_run(
         tile = D.block_image(backend, h_block, phi_final)
         tile_zero = D.block_image(backend, h_block, np.zeros(M_block))
         leak = 0.0  # у блочного (5-3) энергии некуда деться: свёртка круговая
+        power = np.abs(backend.to_numpy(tile)) ** 2
         if scene_transform:  # изображение вышло во всю сцену, берётся полоса блока
-            power = np.abs(backend.to_numpy(tile)) ** 2
-            leak = 1.0 - float(
-                power[block.m_start : block.m_stop].sum() / power.sum()
-            )
-            tile = tile[block.m_start : block.m_stop]
-            tile_zero = tile_zero[block.m_start : block.m_stop]
+            leak = 1.0 - float(power[core[0] : core[1]].sum() / power.sum())
+        tile = tile[core[0] : core[1]]        # решение №6: в мозаику идёт сердцевина
+        tile_zero = tile_zero[core[0] : core[1]]
         images[block.q_k] = tile
         images_before[block.q_k] = tile_zero
 
@@ -1022,6 +1023,58 @@ def experiment_image_shift(
             "mean_shift_no_points": float(np.mean(without_points)),
             "mean_entropy": entropy_shift,
         }
+    return rows
+
+
+def experiment_block_window(
+    grid: tuple[tuple[float, float], ...] = (
+        (0.0, 0.0), (0.0, 0.5), (0.5, 0.0), (0.25, 0.25), (0.5, 0.5), (1.0, 1.0)
+    ),
+    seeds: tuple[int, ...] = (20250915, 7, 101),
+) -> list[dict]:
+    """Решение реализации №6: перехлёст окна блока и дописывание нулей.
+
+    Книга режет сцену на плитки встык. Здесь замеряется, что даёт окно шире
+    плитки, из которого в мозаику идёт только сердцевина:
+
+      перехлёст   расфокусированная цель размазана ШИРЕ своей плитки, и без
+                  перехлёста её хвосты теряются при вырезании;
+      нули        свёртка в (5-3) круговая, и без запаса уехавшее за край
+                  содержимое выходит с другой стороны, накладываясь само
+                  на себя.
+
+    Доли задаются в единицах m_b и подставляются прямо в константы
+    stage_a_blocks — это ЗАМЕР, а не второй способ счёта, поэтому ручек в
+    подписи block_data не заводится; прежние значения возвращаются на место
+    в finally.
+
+    Сравнение идёт по СОБРАННОЙ картинке. Остаток фазы тоже считается, но
+    доверять ему одному нельзя: внесённая в стенде ошибка одна на всю сцену,
+    поэтому широкий перехлёст на нём выглядит лучше, чем есть, — цену
+    пространственной изменчивости видно только по картинке.
+    """
+    saved = (A.BLOCK_OVERLAP_FRACTION, A.BLOCK_ZERO_PAD_FRACTION)
+    rows = []
+    try:
+        for overlap, zeros in grid:
+            A.BLOCK_OVERLAP_FRACTION, A.BLOCK_ZERO_PAD_FRACTION = overlap, zeros
+            runs = [experiment_full_run(seed=seed) for seed in seeds]
+            sharp = [image_sharpness(get_backend("auto"), r["_image_after"]) for r in runs]
+            rows.append({
+                "overlap_fraction": overlap,
+                "zero_pad_fraction": zeros,
+                "transform_length": int(round(43 * (1 + 2 * overlap + 2 * zeros))),
+                "is_book": overlap == 0.0 and zeros == 0.0,
+                "is_chosen": (overlap, zeros) == saved,
+                "converged_blocks": float(np.mean([r["converged_blocks"] for r in runs])),
+                "mean_residual_rms_rad": float(np.mean(
+                    [r["mean_residual_rms_rad"] for r in runs])),
+                "contrast": float(np.mean([m["contrast"] for m in sharp])),
+                "peak": float(np.mean([m["peak"] for m in sharp])),
+                "S": float(np.mean([m["S"] for m in sharp])),
+            })
+    finally:
+        A.BLOCK_OVERLAP_FRACTION, A.BLOCK_ZERO_PAD_FRACTION = saved
     return rows
 
 
