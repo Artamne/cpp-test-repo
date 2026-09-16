@@ -33,3 +33,13 @@
 #     python -c "import backend; print(backend.gpu_status())"
 numpy>=1.24
 matplotlib>=3.6
+
+# Только для bench/prepare_slice.py — чтения записи из .mat. Самому алгоритму
+# и стенду они не нужны, поэтому строки закомментированы: ставьте, если
+# готовите срез реальных данных.
+#
+#     pip install h5py scipy
+#
+# h5py — MATLAB v7.3 это HDF5; scipy.io — паспорт SAR_RDA_Params.mat.
+# h5py>=3.8
+# scipy>=1.10
