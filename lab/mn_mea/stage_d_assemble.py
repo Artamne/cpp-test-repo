@@ -105,7 +105,7 @@ def remove_image_shift(backend: Backend, phi_hat) -> np.ndarray:
     return phi - 2.0 * np.pi * k * image_shift(backend, phi) / M
 
 
-def azimuth_window(backend: Backend, h_block, name: str = AZIMUTH_WINDOW):
+def azimuth_window(backend: Backend, h_block, name: str | None = None):
     """РЕШЕНИЕ РЕАЛИЗАЦИИ №7: домножить данные блока на весовое окно по
     азимуту перед (5-3).
 
@@ -120,6 +120,10 @@ def azimuth_window(backend: Backend, h_block, name: str = AZIMUTH_WINDOW):
 
     В цикл итераций это НЕ входит и входить не должно: см. AZIMUTH_WINDOW.
     """
+    name = AZIMUTH_WINDOW if name is None else name
+    # Значение по умолчанию берётся ЗДЕСЬ, а не в подписи функции: в подписи
+    # оно связалось бы раз и навсегда при определении, и смена AZIMUTH_WINDOW
+    # на ходу не подействовала бы. Ровно на эти грабли уже наступали.
     if name == "none":
         return h_block
     if name not in AZIMUTH_WINDOWS:

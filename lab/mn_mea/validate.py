@@ -374,8 +374,11 @@ def _stage_c_case(
     )
     elapsed = time.perf_counter() - started
 
-    before = backend.to_numpy(D.block_image(backend, h, np.zeros(M)))
-    after = backend.to_numpy(D.block_image(backend, h, result.phi))
+    # Картинки — для показа, поэтому строятся ЧЕРЕЗ ОКНО (решение №7).
+    # По умолчанию окна нет, и тогда это в точности (5-3) без весов.
+    h_shown = D.azimuth_window(backend, h)
+    before = backend.to_numpy(D.block_image(backend, h_shown, np.zeros(M)))
+    after = backend.to_numpy(D.block_image(backend, h_shown, result.phi))
 
     out = {
         "scene": scene_kind, "error": error_kind, "edge_rad": edge_rad,
@@ -977,8 +980,10 @@ def experiment_full_run(
         # на своё место на сцене; энтропии это не меняет — сдвиг целый.
         phi_final = (D.remove_image_shift(backend, result.phi) if deshift
                      else np.asarray(result.phi))
-        tile = D.block_image(backend, h_block, phi_final)
-        tile_zero = D.block_image(backend, h_block, np.zeros(M_block))
+        # решение №7: окно только на показ, оценка фазы уже сделана
+        h_shown = D.azimuth_window(backend, h_block)
+        tile = D.block_image(backend, h_shown, phi_final)
+        tile_zero = D.block_image(backend, h_shown, np.zeros(M_block))
         leak = 0.0  # у блочного (5-3) энергии некуда деться: свёртка круговая
         power = np.abs(backend.to_numpy(tile)) ** 2
         if scene_transform:  # изображение вышло во всю сцену, берётся полоса блока
@@ -1221,7 +1226,7 @@ def experiment_space_variant_run(
         result = C.iterate_block(backend, data.h, phi_0, mu=MU_MEASURED,
                                  core=(data.core_start, data.core_stop))
         phi_final = D.remove_image_shift(backend, result.phi)
-        tile = D.block_image(backend, data.h, phi_final)
+        tile = D.block_image(backend, D.azimuth_window(backend, data.h), phi_final)
         images[block.q_k] = tile[data.core_start : data.core_stop]
 
         # истина этого блока: (5-27) в центре его участка местности
