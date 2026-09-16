@@ -17,6 +17,15 @@
 
 from __future__ import annotations
 
+# Стенд лежит отдельно от алгоритма: algorithm/ рядом, и путь к нему
+# добавляется здесь явно. Алгоритм про стенд не знает ничего и знать не
+# должен — это и есть граница, по которой его снимать на реальные данные.
+import pathlib as _pathlib
+import sys as _sys
+
+_sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent / "algorithm"))
+
+
 import pathlib
 
 import matplotlib

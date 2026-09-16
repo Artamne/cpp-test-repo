@@ -16,6 +16,15 @@
 
 from __future__ import annotations
 
+# Стенд лежит отдельно от алгоритма: algorithm/ рядом, и путь к нему
+# добавляется здесь явно. Алгоритм про стенд не знает ничего и знать не
+# должен — это и есть граница, по которой его снимать на реальные данные.
+import pathlib as _pathlib
+import sys as _sys
+
+_sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent / "algorithm"))
+
+
 import pathlib
 import sys
 
@@ -569,9 +578,9 @@ def main(out_dir: pathlib.Path) -> int:
          cost["exactly_one_w"],
          f"замерено {cost['w_per_iteration_set']}"),
         ("8. Четыре решения из §6 записаны в README.md словами",
-         (pathlib.Path(__file__).parent / "README.md").exists()
+         (pathlib.Path(__file__).resolve().parent.parent / "README.md").exists()
          and "решение реализации №4"
-         in (pathlib.Path(__file__).parent / "README.md").read_text(encoding="utf-8").lower(),
+         in (pathlib.Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8").lower(),
          "см. README.md, раздел «Решения реализации»"),
         ("9. Шесть расхождений книги помечены в коде по месту",
          all(_discrepancy_marks().values()),
@@ -627,7 +636,8 @@ def _discrepancy_marks() -> dict[str, bool]:
     Возвращает словарь {метка: найдена ли}. Ищется строка вида
     «РАСХОЖДЕНИЕ <метка>: ... см. §8» в файлах этапов.
     """
-    here = pathlib.Path(__file__).parent
+    # файлы этапов лежат в algorithm/, рядом со стендом, а не внутри него
+    here = pathlib.Path(__file__).resolve().parent.parent / "algorithm"
     text = "".join(
         (here / name).read_text(encoding="utf-8")
         for name in ("stage_a_blocks.py", "stage_b_initial.py",
@@ -643,5 +653,5 @@ def _count_discrepancy_marks() -> int:
 
 
 if __name__ == "__main__":
-    target = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__).parent / "out"
+    target = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__).resolve().parent.parent / "out"
     raise SystemExit(main(target))
