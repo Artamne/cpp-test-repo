@@ -4,6 +4,16 @@
 
     python prepare_slice_rda.py "D:\\test1\\results\\src-0454fb28e3_rda@4ec41d.h5"
 
+ОКНО МОЖНО ЗАДАТЬ РУКАМИ, границами в отсчётах массива:
+
+    python prepare_slice_rda.py файл.h5 impulsy=2000:4400
+    python prepare_slice_rda.py файл.h5 stroby=100:1760 impulsy=2000:4400
+
+Что не задано — выбирается как раньше: стробы по зоне матрицы скорости,
+импульсы по её же индексу или, если он вне кадра, по энергии. Границы
+берутся ровно как даны, без подгонки под длину апертуры: сколько указали,
+столько и будет в срезе.
+
 Больше ничего вводить не надо. Всё остальное скрипт находит сам:
 
     паспорт съёмки   — внутри того же h5, группа `params` и `params/__extra__`
@@ -269,6 +279,40 @@ def range_axis_metres(passport: dict, check: dict, ka_dir: str) -> np.ndarray:
     return r0 + r_b * np.arange(passport["shape"][0], dtype=np.float64)
 
 
+def parse_window(words: list[str], n_r: int, n_az: int) -> dict[str, int]:
+    """Разобрать заданное руками окно из аргументов командной строки.
+
+    Принимает слова после пути, число стробов и число импульсов; возвращает
+    словарь с теми из ключей 'r0','r1','a0','a1', что заданы.
+
+    Вид аргумента: stroby=100:1760, impulsy=2000:4400. Границы — индексы в
+    массиве кадра, как их показывает просмотрщик. Отсутствующая сторона
+    означает край: impulsy=2000: читается до конца кадра.
+
+    Проверяется только то, что границы лежат в кадре и не вывернуты. Ни
+    подгонки под длину апертуры, ни округления: сказано 2000:4400 — значит
+    ровно 2400 импульсов.
+    """
+    keys = {"stroby": ("r0", "r1", n_r), "impulsy": ("a0", "a1", n_az)}
+    out: dict[str, int] = {}
+    for word in words:
+        if "=" not in word:
+            sys.exit(f"не разобрать аргумент {word!r}; ожидалось "
+                     "stroby=НАЧАЛО:КОНЕЦ или impulsy=НАЧАЛО:КОНЕЦ")
+        name, _, span = word.partition("=")
+        if name not in keys:
+            sys.exit(f"неизвестный аргумент {name!r}; есть {sorted(keys)}")
+        lo_key, hi_key, limit = keys[name]
+        lo_text, _, hi_text = span.partition(":")
+        lo = int(lo_text) if lo_text else 0
+        hi = int(hi_text) if hi_text else limit
+        if not (0 <= lo < hi <= limit):
+            sys.exit(f"{name}={span}: границы вне кадра или вывернуты, "
+                     f"в кадре {limit}")
+        out[lo_key], out[hi_key] = lo, hi
+    return out
+
+
 def azimuth_energy(rda_path: str, r0: int, r1: int) -> tuple[np.ndarray, int]:
     """Прореженный профиль энергии по азимуту в выбранных стробах.
 
@@ -520,6 +564,7 @@ def main() -> None:
     rda = sys.argv[1]
     if not os.path.isfile(rda):
         sys.exit(f"нет файла {rda}")
+    window_words = sys.argv[2:]
     out_dir = os.path.join(os.path.dirname(rda), OUT_NAME)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -572,9 +617,10 @@ def main() -> None:
         print(f"    az_bin {a:6d}   v {vv:6.2f} м/с   вес {w:5.2f}")
     print(f"  взято {vel['v']:.3f} м/с, центр по азимуту {vel['az_bin']}")
 
+    window = parse_window(window_words, *passport["shape"])
     cut = choose_slice(R_axis, vel, passport["shape"][1], prf, lambda_,
                        rho_a, gamma, rda)
-    if not cut["az_in_frame"]:
+    if not cut["az_in_frame"] and "a0" not in window:
         print(f"\n  ВНИМАНИЕ: az_bin = {vel['az_bin']} не принадлежит кадру "
               f"(импульсов всего {passport['shape'][1]}). Матрица скорости "
               "индексирует полную запись, а это её кусок, и смещения куска в "
@@ -585,16 +631,30 @@ def main() -> None:
               f"{vel['v']:.3f} м/с (по всей зоне было {vel['v_wide']:.3f})")
         cut = choose_slice(R_axis, vel, passport["shape"][1], prf, lambda_,
                            rho_a, gamma, rda)
-    else:
+    elif "a0" not in window:
         print("  ВНИМАНИЕ: внутри окна нет ни одной ячейки скорости; взята "
               "скорость по всей зоне, она может описывать не этот срез")
+    if window:
+        cut.update(window)
+        if "a0" in window:
+            cut["az_source"] = "ЗАДАНО РУКАМИ"
+        # R_B0 и шаг по дальности пересчитываются по НОВЫМ границам: центр
+        # окна сдвинулся, а от него зависит и T_a, и размер блока
+        if "r0" in window:
+            centre = (cut["r0"] + cut["r1"]) // 2
+            cut["R_B0"] = float(R_axis[min(centre, R_axis.size - 1)])
+            cut["T_a"] = gamma * lambda_ * cut["R_B0"] / (2.0 * rho_a * vel["v"])
+            cut["M_aperture"] = int(round(cut["T_a"] * prf))
+        print(f"\n  окно задано руками: "
+              + ", ".join(f"{k}={window[k]}" for k in sorted(window)))
+
     print(f"\nсрез")
     print(f"  R_B0 = {cut['R_B0']:.1f} м, T_a = {cut['T_a']:.4f} с, "
           f"M_aperture = {cut['M_aperture']}")
     print(f"  стробы   {cut['r0']} … {cut['r1']}  ({cut['r1']-cut['r0']})")
     print(f"  импульсы {cut['a0']} … {cut['a1']}  ({cut['a1']-cut['a0']}), "
           f"положение по: {cut['az_source']}")
-    if cut["energy_best"]:
+    if cut["energy_best"] and not window.get("a0"):
         ratio = cut["energy_best"] / max(cut["energy_here"], 1e-30)
         print(f"  энергия окна {cut['energy_here']:.4g}, лучшая на кадре "
               f"{cut['energy_best']:.4g} (в {ratio:.1f} раза) при a0 = "
