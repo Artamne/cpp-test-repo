@@ -21,6 +21,11 @@
                     окрестностям целей, а не по всему блоку. На местности
                     без этого блок возвращает ноль: фон давит цели. По
                     умолчанию выключено, поведение книжное
+    start=polinom   ЭТАП B БЕЗ ИНС (по умолчанию): начальная фаза phi^(0)
+                    ищется как полином по энтропии всей сцены
+                    (stage_b_search.py), и этап C идёт из неё. start=nol —
+                    этап C из нуля, как было; на настоящей записи так не
+                    работает, см. stage_b_search
 
 ЧЕТВЁРТЫЙ АРГУМЕНТ — ПРОБА, и он отвечает на вопрос, который иначе не
 решается. Если прогон почти ничего не меняет, причин ровно две: остаточной
@@ -50,7 +55,7 @@
 
     read_slice          прочитать куски h_srez*.npy и meta.json, склеить
     geometry_from_meta  Geometry из паспорта, разрешение отдельно от шага
-    focus               блоки, этап C из нуля, этап D
+    focus               блоки, этап B без ИНС, этап C, этап D
     grid_agreement      сверка нарезки с ожиданием паспорта
     contrast            число, которое алгоритм НЕ минимизирует
     main                всё вместе, с печатью и картинкой
@@ -72,6 +77,7 @@ import numpy as np
 
 import inputs
 import stage_a_blocks as A
+import stage_b_search as BS
 import stage_c_iterate as C
 import stage_d_assemble as D
 from backend import get_backend
@@ -156,7 +162,7 @@ def parse_options(words: list[str]) -> tuple:
     """Разобрать аргументы после пути.
 
     Принимает слова; возвращает (сетка, mu, проба, предел итераций, общая ли
-    фаза).
+    фаза, доля целей, откуда стартовать).
 
     Позиционные и именованные мешаются свободно, и правило простое: слово с
     '=' — именованное; слово вида ЧИСЛОxЧИСЛО — сетка; голое число — сперва
@@ -166,6 +172,7 @@ def parse_options(words: list[str]) -> tuple:
     """
     grid, mu, probe = None, MU_REAL, 0.0
     iterations, shared, targets = C.MAX_ITERATIONS, False, None
+    start = "polinom"
     bare = 0
     for word in words:
         if "=" in word:
@@ -185,9 +192,13 @@ def parse_options(words: list[str]) -> tuple:
                 if value not in ("svoya", "luchshaya"):
                     sys.exit(f"faza={value}: есть svoya и luchshaya")
                 shared = value == "luchshaya"
+            elif name == "start":
+                if value not in ("polinom", "nol"):
+                    sys.exit(f"start={value}: есть polinom и nol")
+                start = value
             else:
                 sys.exit(f"неизвестный аргумент {name!r}; есть setka, mu, "
-                         "proba, iter, faza, celi")
+                         "proba, iter, faza, celi, start")
         elif re.fullmatch(r"\d+[xX]\d+", word):
             a, b = word.lower().split("x")
             grid = (int(a), int(b))
@@ -200,7 +211,7 @@ def parse_options(words: list[str]) -> tuple:
             else:
                 sys.exit(f"лишнее число {word!r}: голыми идут только mu и проба")
             bare += 1
-    return grid, mu, probe, iterations, shared, targets
+    return grid, mu, probe, iterations, shared, targets, start
 
 
 def read_slice(directory: pathlib.Path) -> tuple[np.ndarray, dict]:
@@ -311,16 +322,27 @@ def best_block(rows: list[dict]) -> dict | None:
 def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
           mu: float = MU_REAL, max_iterations: int = C.MAX_ITERATIONS,
           shared_phase: bool = False,
-          target_fraction: float | None = None) -> dict:
-    """Собственно прогон: блоки, этап C из нуля, этап D.
+          target_fraction: float | None = None,
+          start: str = "polinom") -> dict:
+    """Собственно прогон: блоки, этап B без ИНС, этап C, этап D.
 
     Принимает h, Geometry, сетку блоков (или None — тогда по (5-20)), порог
-    останова, предел итераций и признак общей фазы; возвращает словарь с
-    картинками и числами по блокам.
+    останова, предел итераций, признак общей фазы, долю целей и откуда
+    стартовать ('polinom' или 'nol'); возвращает словарь с картинками и
+    числами по блокам.
 
-    Начальная фаза НУЛЕВАЯ, этап B не делается. Замер на стенде показал, что
-    книжная (5-30) не помогает, а мешает: член -(q-q_k)/2 из (5-29) уводит
-    eta в диапазон около [-6, +0,6]. См. README, «Если ИНС нет».
+    Книжный этап B (из параметров движения) не делается: ИНС нет. Замер на
+    стенде показал, что книжная (5-30) без них не помогает, а мешает: член
+    -(q-q_k)/2 из (5-29) уводит eta в диапазон около [-6, +0,6]. См.
+    README, «Если ИНС нет».
+
+    ВМЕСТО НЕГО — ЭТАП B БЕЗ ИНС (start='polinom', по умолчанию):
+    stage_b_search ищет phi^(0) как полином по энтропии всей сцены, и
+    каждый блок получает его на свою доплеровскую сетку через
+    truth_on_block_grid. Почему из нуля нельзя — замер в шапке
+    stage_b_search: на настоящей записи шаг Ньютона из нуля составляет
+    0,2…1 % от истины, и даже заведомо внесённые 8 рад этап C из нуля не
+    снимает (снято 6 %). Полином по всей сцене ту же ошибку находит.
 
     ОБЩАЯ ФАЗА (shared_phase) — не из книги, и вот зачем она. Сведения о
     фазе несут только яркие точечные отражатели: замер показал, что крупные
@@ -354,12 +376,17 @@ def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
     h_device = backend.asarray(h)
     scene = A.scene_image(backend, h_device)
 
+    # этап B без ИНС: одна начальная фаза на сцену, на сетке сцены
+    initial = BS.search(backend, h_device) if start == "polinom" else None
+
     # первый проход: каждый блок ищет свою фазу
     rows = []
     for block in blocks:
         data = A.block_data(backend, scene, block)
         L = data.h.shape[0]
-        result = C.iterate_block(backend, data.h, np.zeros(L), mu=mu,
+        phi_0 = (truth_on_block_grid(initial.phi, L) if initial is not None
+                 else np.zeros(L))
+        result = C.iterate_block(backend, data.h, phi_0, mu=mu,
                                  max_iterations=max_iterations,
                                  core=(data.core_start, data.core_stop),
                                  target_fraction=target_fraction)
@@ -370,6 +397,7 @@ def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
             "converged": result.converged,
             "entropy_before": result.normalised_entropy_history[0],
             "entropy_after": result.normalised_entropy_final,
+            "best_iteration": result.best_iteration,
             "frozen_bins": int(sum(result.frozen_bins_history)),
             "live_bins": result.n_live_bins,
             "block_bins": L,
@@ -397,7 +425,7 @@ def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
 
     return {
         "blocks": blocks, "M_k": M_k, "N_k": N_k, "per_block": rows,
-        "m_p": m_p, "n_p": n_p, "donor": donor,
+        "m_p": m_p, "n_p": n_p, "donor": donor, "initial": initial,
         "image_before": backend.to_numpy(D.assemble(backend, before, blocks, M, N)),
         "image_after": backend.to_numpy(D.assemble(backend, after, blocks, M, N)),
         "backend": backend,
@@ -578,7 +606,7 @@ def main() -> int:
         print(__doc__)
         return 2
     directory = pathlib.Path(sys.argv[1])
-    grid, mu, probe, iterations, shared, targets = parse_options(sys.argv[2:])
+    grid, mu, probe, iterations, shared, targets, start = parse_options(sys.argv[2:])
 
     h, meta = read_slice(directory)
     geom = geometry_from_meta(meta)
@@ -603,12 +631,22 @@ def main() -> int:
         print(line)
 
     run = focus(h, geom, grid, mu=mu, max_iterations=iterations,
-                shared_phase=shared, target_fraction=targets)
+                shared_phase=shared, target_fraction=targets, start=start)
     print(f"\nсетка блоков {run['M_k']}x{run['N_k']}, порог (5-9) mu = {mu:g}, "
-          f"предел {iterations} итераций, начальная фаза нулевая "
-          f"(этап B не делается)"
+          f"предел {iterations} итераций"
           + (f", критерий по целям ({100*targets:g} % стробов, решение №9)"
              if targets else ""))
+    if run["initial"] is not None:
+        ini = run["initial"]
+        print(f"этап B без ИНС: полином по энтропии сцены, "
+              f"S {ini.entropy_start:.4f} -> {ini.entropy_final:.4f} "
+              f"({ini.entropy_final - ini.entropy_start:+.4f}), "
+              f"{ini.n_evaluations} оценок; коэффициенты при Лежандре "
+              + ", ".join(f"P{d} = {c:+.2f}" for d, c in ini.coefficients.items())
+              + f" рад; размах phi^(0) в полосе "
+              f"{ini.phi.max() - ini.phi.min():.1f} рад")
+    else:
+        print("начальная фаза нулевая (start=nol), этап B не делается")
     if run["donor"] is not None:
         d = run["donor"]
         drops = sorted(r["entropy_before"] - r["entropy_after"]
@@ -659,7 +697,7 @@ def main() -> int:
         spoiled = h * np.exp(-1j * phi_probe)[:, None].astype(h.dtype)
         run_probe = focus(spoiled, geom, grid, mu=mu,
                           max_iterations=iterations, shared_phase=shared,
-                          target_fraction=targets)
+                          target_fraction=targets, start=start)
 
         print(f"\n{'блок':>5}{'внесено, рад':>14}{'осталось, рад':>15}"
               f"{'снято':>8}")

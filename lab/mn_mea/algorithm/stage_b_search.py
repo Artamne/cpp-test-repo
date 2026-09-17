@@ -1,0 +1,282 @@
+# -*- coding: utf-8 -*-
+"""Этап B без ИНС: начальная фаза phi^(0) поиском полинома по энтропии сцены.
+
+Книжный этап B (stage_b_initial.py) строит phi^(0) из параметров движения
+носителя (4-83), (4-84), (5-27)…(5-30). Когда ИНС нет, параметров нет, и
+этап B в run_real.py не делался: этап C шёл из нуля. На настоящей записи
+это не работает, и вот почему — замер на срезе владельца с ЗАВЕДОМО
+внесённой квадратичной фазой 3 рад (8 рад на краю полосы):
+
+    шаг Ньютона (5-8) из нуля      0,2…1,2 % от истины по модулю
+    косинус шага с истиной         от -0,6 до +0,6, в среднем около нуля
+    после 200 итераций             остаток 0,96…1,25 от внесённого
+
+Пофазный градиент (5-13) в блоке из 273 x 1335 отсчётов клаттера тонет в
+шуме: у каждого доплеровского бина свой случайный вклад от спекла, и
+осмысленную часть градиента — общую для всех бинов — за ним не видно. На
+подделке с яркими точками на тёмном фоне того же не было, потому что там
+шума в градиенте нет.
+
+Полином же ищется по ВСЕЙ сцене и всего с несколькими коэффициентами:
+шум по бинам усредняется, и энтропия как функция коэффициента гладкая с
+одним минимумом (замер: двумерный скан по квадратичной и кубической на
+срезе владельца — одна впадина). На той же записи с внесённой ошибкой
+поиск нашёл -6,5 при внесённых -3 и собственном остатке сцены -3.
+
+Это НЕ замена этапа C и НЕ улучшение формул книги: найденный полином идёт
+в этап C как phi^(0), ровно на место, которое книга отводит этапу B. Этап C
+из этой точки снимает то, что полиномом не описывается.
+
+Порядок функций — порядок выполнения:
+
+    band_axis          нормированная частота u: 0 вне полосы, +-1 на её краю
+    legendre           многочлен Лежандра P_d(u)
+    polynomial_phase   phi(u) = sum c_d P_d(u) по степеням DEGREES
+    scene_entropy      (5-6) по всей сцене при данной phi — одно БПФ
+    refine_coefficient один коэффициент: перебор с шагом, потом парабола
+    search             грубая сетка по двум степеням, затем покоординатное уточнение
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+
+import stage_c_iterate as C
+from backend import Backend
+
+#: Степени многочленов Лежандра P_d(u). Первая (линейная) не ищется: она
+#: лишь сдвигает картинку по азимуту, энтропии не меняет и снимается в
+#: этапе D (remove_image_shift). Базис именно Лежандра, а не степени u:
+#: u^2 и u^4 на отрезке [-1, 1] почти коллинеарны, и покоординатный спуск
+#: по ним ползёт — замер: u^4 уходил в +12,8, пока u^2 не дошёл до
+#: своего минимума. Многочлены Лежандра на этом отрезке ортогональны.
+#:
+#: Только вторая и третья степень — ошибка скорости (квадратичная) и
+#: ускорения (кубическая), то, что даёт полёт. Четвёртая и пятая
+#: проверены и ОТБРОШЕНЫ: на срезе владельца они опускают энтропию ещё на
+#: 0,005 из 0,040, но с заведомо внесённой чисто квадратичной ошибкой
+#: коэффициент при P_4 менялся на 2,9 между чистыми и испорченными
+#: данными — впадина по нему плоская, и он ловит шум. Что выше третьей
+#: степени, снимает этап C по бинам.
+DEGREES = (2, 3)
+
+#: Начальный шаг перебора коэффициента, радианы (коэффициент при P_d;
+#: |P_d| <= 1, так что это и размах на краю полосы). Выбран по замеру:
+#: остатки на срезе владельца 8…14 рад, впадина энтропии шириной около
+#: 10 рад; шаг 4 с пятью точками накрывает +-8 и не перескакивает впадину,
+#: а расширение перебора (см. refine_coefficient) достаёт и дальше.
+STEP_INITIAL_RAD = 4.0
+
+#: Кругов покоординатного спуска; шаг каждый круг делится пополам. Четыре
+#: круга дают точность около шага/8 = 0,5 рад — дальше доводит этап C.
+ROUNDS = 4
+
+#: Точек перебора вокруг текущего значения: -2, -1, 0, +1, +2 шага.
+PROBE_OFFSETS = (-2.0, -1.0, 0.0, 1.0, 2.0)
+
+#: Полуширина грубой сетки по каждому коэффициенту, в шагах STEP_INITIAL_RAD:
+#: сетка накрывает +-GRID_HALF_STEPS*шаг = +-16 рад. Сетка идёт ПЕРЕД
+#: покоординатным спуском: впадина энтропии на клаттере мелкая (0,04 при
+#: 13,4) и с несколькими ложбинами, и спуск по одной координате застревает
+#: — замер на срезе владельца: спуск нашёл dS -0,017 там, где сетка
+#: показывала -0,036. Сетка по двум коэффициентам — 81 оценка.
+GRID_HALF_STEPS = 4
+
+#: Сколько раз перебор может сдвинуться за край, если минимум упёрся в
+#: крайнюю точку. Без этого поиск не достаёт ошибку больше 2*шаг*ROUNDS:
+#: замер с внесёнными 8 рад поверх собственных 10 — нашёл 14 из 18.
+EXTEND_LIMIT = 6
+
+
+@dataclass
+class SearchResult:
+    """Что нашёл поиск и по каким числам."""
+
+    phi: np.ndarray                              # phi^(0) на сетке сцены, длина M
+    coefficients: dict[int, float]               # степень -> коэффициент, рад на краю
+    entropy_start: float                         # (5-6) при phi = 0
+    entropy_final: float                         # (5-6) при найденной phi
+    n_evaluations: int = 0                       # сколько раз считалась энтропия
+    history: list[tuple[int, int, float, float]] = field(default_factory=list)
+    band_edge: float = 0.0                       # край полосы, доли частоты повторения
+    n_band_bins: int = 0
+
+
+def band_axis(backend: Backend, h, floor_factor: float = C.SIGNAL_FLOOR_FACTOR):
+    """Нормированная доплеровская частота u для полинома.
+
+    Принимает бэкенд, данные сцены h(k,n) и порог решения №7; возвращает
+    (u, край полосы, число бинов в полосе). u = f / f_края внутри полосы,
+    ноль вне её: там сигнала нет, и фаза там ничего не значит, а полином,
+    продолженный за край, уходил бы в десятки радиан и вносил бы в пустые
+    бины бессмысленную фазу (проверено пробой в run_real: «снято 1 %»).
+
+    Край берётся по тем же живым бинам, что и решение №7, — одно
+    определение полосы на весь конвейер.
+    """
+    h_abs2 = backend.xp.abs(backend.asarray(h)) ** 2
+    live = backend.to_numpy(C.signal_bins(backend, h_abs2, floor_factor)).astype(bool)
+    M = live.size
+    f = np.fft.fftfreq(M)
+    edge = float(np.abs(f[live]).max()) if live.any() else 0.5
+    u = np.where(live, f / edge, 0.0)
+    return u, edge, int(live.sum())
+
+
+def legendre(u: np.ndarray, degree: int) -> np.ndarray:
+    """Многочлен Лежандра P_d(u) по рекуррентной формуле Бонне."""
+    p_prev, p = np.ones_like(u), u.copy()
+    if degree == 0:
+        return p_prev
+    for d in range(1, degree):
+        p_prev, p = p, ((2 * d + 1) * u * p - d * p_prev) / (d + 1)
+    return p
+
+
+def polynomial_phase(u: np.ndarray, coefficients: dict[int, float]) -> np.ndarray:
+    """phi(u) = sum_d c_d P_d(u). Принимает ось u и словарь степень -> коэффициент.
+
+    Вне полосы u = 0, и P_d(0) для чётных d НЕ ноль — поэтому фаза вне
+    полосы обнуляется явно: там сигнала нет, и фаза там ничего не значит.
+    """
+    phi = np.zeros_like(u)
+    for degree, c in coefficients.items():
+        if c != 0.0:
+            phi += c * legendre(u, degree)
+    phi[u == 0.0] = 0.0
+    return phi
+
+
+def scene_entropy(backend: Backend, h, phi, S_g: float, floor: float) -> float:
+    """(5-6) всей сцены при фазе phi — одно азимутальное БПФ.
+
+    Принимает бэкенд, данные сцены на устройстве, фазу, энергию (5-4) и
+    порог решения №1; возвращает нормированную энтропию S.
+
+    Считается теми же функциями, что и в этапе C, — это то же самое
+    число, которое этап C будет минимизировать, только по всей сцене
+    и без маски.
+    """
+    _, g = C.image_from_phase(backend, h, backend.asarray(phi))
+    P, _, _ = C.image_power(backend, g, floor)
+    return C.entropy(backend, P, S_g, None)[1]
+
+
+def refine_coefficient(evaluate, coefficients: dict[int, float], degree: int,
+                       step: float) -> tuple[float, float]:
+    """Уточнить один коэффициент: перебор PROBE_OFFSETS, затем парабола.
+
+    Принимает функцию S(коэффициенты), текущие коэффициенты, степень и
+    шаг; возвращает (новое значение, S в нём). Коэффициенты меняются на
+    месте.
+
+    Парабола строится по лучшей точке перебора и двум её соседям, и
+    берётся только если её вершина лежит между соседями и энтропия там
+    действительно ниже: вершина параболы вне отрезка — не минимум, а
+    экстраполяция. Если лучшая точка — крайняя, перебор продолжается в ту
+    сторону (EXTEND_LIMIT), иначе поиск не достаёт больших ошибок.
+    """
+    c0 = coefficients[degree]
+    probes = []
+    for off in PROBE_OFFSETS:
+        coefficients[degree] = c0 + off * step
+        probes.append((evaluate(coefficients), coefficients[degree]))
+    best = min(range(len(probes)), key=lambda i: probes[i][0])
+    # минимум на краю перебора — впадина дальше, чем достаёт сетка; идём
+    # туда шаг за шагом, пока не перевалим через минимум или не упрёмся
+    # в EXTEND_LIMIT
+    extended = 0
+    while best in (0, len(probes) - 1) and extended < EXTEND_LIMIT:
+        direction = -1.0 if best == 0 else 1.0
+        coefficients[degree] = probes[best][1] + direction * step
+        probe = (evaluate(coefficients), coefficients[degree])
+        if best == 0:
+            probes.insert(0, probe)
+        else:
+            probes.append(probe)
+            best = len(probes) - 1
+        best = min(range(len(probes)), key=lambda i: probes[i][0])
+        extended += 1
+    S_best, c_best = probes[best]
+    if 0 < best < len(probes) - 1:
+        (S_l, c_l), (S_r, c_r) = probes[best - 1], probes[best + 1]
+        denominator = S_l - 2.0 * S_best + S_r
+        if denominator > 0.0:
+            c_v = c_best + 0.5 * step * (S_l - S_r) / denominator
+            if c_l < c_v < c_r:
+                coefficients[degree] = c_v
+                S_v = evaluate(coefficients)
+                if S_v < S_best:
+                    return c_v, S_v
+    coefficients[degree] = c_best
+    return c_best, S_best
+
+
+def search(backend: Backend, h, degrees=DEGREES, step_initial: float = STEP_INITIAL_RAD,
+           rounds: int = ROUNDS, floor_factor: float = C.SIGNAL_FLOOR_FACTOR,
+           floor_relative: float = C.POWER_FLOOR_RELATIVE) -> SearchResult:
+    """Покоординатный спуск по коэффициентам полинома, по энтропии сцены.
+
+    Принимает бэкенд и данные сцены h(k,n); возвращает SearchResult с
+    phi^(0) на доплеровской сетке сцены.
+
+    Сначала грубая сетка по двум первым степеням (GRID_HALF_STEPS), потом
+    покоординатное уточнение (rounds кругов, шаг делится пополам).
+
+    Стоимость: одно БПФ сцены на оценку; сетка 81 плюс уточнение около 50
+    — примерно 130 БПФ сцены. У этапа C на 22 блоках по 200 итераций их
+    8800.
+    """
+    h_device = backend.asarray(h)
+    M, N = h_device.shape
+    u, edge, n_band = band_axis(backend, h_device, floor_factor)
+    h_abs2 = backend.xp.abs(h_device) ** 2
+    S_g = C.total_energy(backend, h_abs2, M)
+    floor = C.power_floor(S_g, M, N, floor_relative)
+
+    counter = {"n": 0}
+
+    def evaluate(coefficients: dict[int, float]) -> float:
+        counter["n"] += 1
+        return scene_entropy(backend, h_device, polynomial_phase(u, coefficients),
+                             S_g, floor)
+
+    coefficients = {d: 0.0 for d in degrees}
+    S_start = evaluate(coefficients)
+    history = []
+
+    # грубая сетка по ПЕРВЫМ ДВУМ степеням (остальные в нуле): ищет ложбину,
+    # в которой потом уточняться, а не ближайшую к нулю
+    grid = [k * step_initial for k in range(-GRID_HALF_STEPS, GRID_HALF_STEPS + 1)]
+    S_now, best = S_start, dict(coefficients)
+    d_a, d_b = degrees[0], degrees[1] if len(degrees) > 1 else degrees[0]
+    for c_a in grid:
+        for c_b in (grid if d_b != d_a else [0.0]):
+            coefficients[d_a], coefficients[d_b] = c_a, c_b
+            S_here = evaluate(coefficients)
+            if S_here < S_now:
+                S_now, best = S_here, dict(coefficients)
+    coefficients = best
+    history.append((0, d_a, coefficients[d_a], S_now))
+    history.append((0, d_b, coefficients[d_b], S_now))
+
+    # уточнение: покоординатный спуск с убывающим шагом, от шага сетки
+    step = step_initial
+    for round_index in range(rounds):
+        for degree in degrees:
+            _, S_now = refine_coefficient(evaluate, coefficients, degree, step)
+            history.append((round_index + 1, degree, coefficients[degree], S_now))
+        step /= 2.0
+
+    return SearchResult(
+        phi=polynomial_phase(u, coefficients),
+        coefficients=dict(coefficients),
+        entropy_start=S_start,
+        entropy_final=S_now,
+        n_evaluations=counter["n"],
+        history=history,
+        band_edge=edge,
+        n_band_bins=n_band,
+    )
