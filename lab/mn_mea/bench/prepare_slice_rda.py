@@ -4,10 +4,14 @@
 
     python prepare_slice_rda.py "D:\\test1\\results\\src-0454fb28e3_rda@4ec41d.h5"
 
-ОКНО МОЖНО ЗАДАТЬ РУКАМИ, границами в отсчётах массива:
+ОКНО МОЖНО ЗАДАТЬ РУКАМИ:
 
-    python prepare_slice_rda.py файл.h5 impulsy=2000:4400
+    python prepare_slice_rda.py файл.h5 stroby_m=2868.6:3485.3 impulsy=0:
     python prepare_slice_rda.py файл.h5 stroby=100:1760 impulsy=2000:4400
+
+stroby_m — наклонная дальность В МЕТРАХ, переводится точно по оси R_vec из
+самого файла. stroby и impulsy — отсчёты массива. impulsy=0: берёт весь
+кадр по азимуту.
 
 Что не задано — выбирается как раньше: стробы по зоне матрицы скорости,
 импульсы по её же индексу или, если он вне кадра, по энергии. Границы
@@ -279,31 +283,57 @@ def range_axis_metres(passport: dict, check: dict, ka_dir: str) -> np.ndarray:
     return r0 + r_b * np.arange(passport["shape"][0], dtype=np.float64)
 
 
-def parse_window(words: list[str], n_r: int, n_az: int) -> dict[str, int]:
+def parse_window(words: list[str], n_r: int, n_az: int,
+                 R_axis: np.ndarray) -> dict[str, int]:
     """Разобрать заданное руками окно из аргументов командной строки.
 
-    Принимает слова после пути, число стробов и число импульсов; возвращает
-    словарь с теми из ключей 'r0','r1','a0','a1', что заданы.
+    Принимает слова после пути, размеры кадра и ось дальности в метрах;
+    возвращает словарь с теми из ключей 'r0','r1','a0','a1', что заданы.
 
-    Вид аргумента: stroby=100:1760, impulsy=2000:4400. Границы — индексы в
-    массиве кадра, как их показывает просмотрщик. Отсутствующая сторона
-    означает край: impulsy=2000: читается до конца кадра.
+    Четыре вида аргумента:
 
-    Проверяется только то, что границы лежат в кадре и не вывернуты. Ни
-    подгонки под длину апертуры, ни округления: сказано 2000:4400 — значит
-    ровно 2400 импульсов.
+        stroby=100:1760        по дальности, ОТСЧЁТЫ массива
+        stroby_m=2868.6:3485.3 по дальности, МЕТРЫ наклонной дальности
+        impulsy=2000:4400      по азимуту, ОТСЧЁТЫ массива
+        impulsy=0:             по азимуту, весь кадр целиком
+
+    Метры по дальности переводятся точно: ось R_vec лежит в самом файле,
+    строб находится поиском по ней. Метров по азимуту здесь НЕТ намеренно.
+    Просмотрщик отсчитывает азимут вдоль ВСЕЙ записи, а rda-файл — её кусок,
+    и смещения куска в паспорте нет (тот же az_bin, что не лезет в кадр).
+    Пересчитать метры в отсчёты кадра было бы гаданием, а гадать в выборе
+    участка нельзя.
+
+    Отсутствующая сторона означает край: impulsy=2000: читается до конца.
+    Проверяется, что границы лежат в кадре и не вывернуты. Ни подгонки под
+    длину апертуры, ни округления: сказано 2000:4400 — ровно 2400 импульсов.
     """
     keys = {"stroby": ("r0", "r1", n_r), "impulsy": ("a0", "a1", n_az)}
     out: dict[str, int] = {}
     for word in words:
         if "=" not in word:
             sys.exit(f"не разобрать аргумент {word!r}; ожидалось "
-                     "stroby=НАЧАЛО:КОНЕЦ или impulsy=НАЧАЛО:КОНЕЦ")
+                     "stroby=, stroby_m=, impulsy= со значением НАЧАЛО:КОНЕЦ")
         name, _, span = word.partition("=")
-        if name not in keys:
-            sys.exit(f"неизвестный аргумент {name!r}; есть {sorted(keys)}")
-        lo_key, hi_key, limit = keys[name]
         lo_text, _, hi_text = span.partition(":")
+
+        if name == "stroby_m":
+            lo_m = float(lo_text) if lo_text else float(R_axis[0])
+            hi_m = float(hi_text) if hi_text else float(R_axis[-1])
+            lo = int(np.searchsorted(R_axis, min(lo_m, hi_m)))
+            hi = int(np.searchsorted(R_axis, max(lo_m, hi_m)))
+            print(f"  по дальности {lo_m:.1f} … {hi_m:.1f} м -> стробы "
+                  f"{lo} … {hi} (ось кадра {R_axis[0]:.1f} … {R_axis[-1]:.1f} м)")
+            if hi <= lo:
+                sys.exit(f"stroby_m={span}: в этот отрезок не попал ни один "
+                         f"строб; ось кадра {R_axis[0]:.1f} … {R_axis[-1]:.1f} м")
+            out["r0"], out["r1"] = max(lo, 0), min(hi, n_r)
+            continue
+
+        if name not in keys:
+            sys.exit(f"неизвестный аргумент {name!r}; есть stroby, stroby_m, "
+                     "impulsy")
+        lo_key, hi_key, limit = keys[name]
         lo = int(lo_text) if lo_text else 0
         hi = int(hi_text) if hi_text else limit
         if not (0 <= lo < hi <= limit):
@@ -617,7 +647,7 @@ def main() -> None:
         print(f"    az_bin {a:6d}   v {vv:6.2f} м/с   вес {w:5.2f}")
     print(f"  взято {vel['v']:.3f} м/с, центр по азимуту {vel['az_bin']}")
 
-    window = parse_window(window_words, *passport["shape"])
+    window = parse_window(window_words, *passport["shape"], R_axis)
     cut = choose_slice(R_axis, vel, passport["shape"][1], prf, lambda_,
                        rho_a, gamma, rda)
     if not cut["az_in_frame"] and "a0" not in window:
