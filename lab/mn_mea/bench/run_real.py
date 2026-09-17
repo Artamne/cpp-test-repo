@@ -48,7 +48,7 @@
 
 Порядок функций — порядок выполнения:
 
-    read_slice          прочитать h_srez.npy и meta.json
+    read_slice          прочитать куски h_srez*.npy и meta.json, склеить
     geometry_from_meta  Geometry из паспорта, разрешение отдельно от шага
     focus               блоки, этап C из нуля, этап D
     grid_agreement      сверка нарезки с ожиданием паспорта
@@ -58,6 +58,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import pathlib
@@ -203,12 +204,63 @@ def parse_options(words: list[str]) -> tuple:
 
 
 def read_slice(directory: pathlib.Path) -> tuple[np.ndarray, dict]:
-    """Прочитать срез и паспорт.
+    """Прочитать срез и паспорт, склеив куски.
 
-    Принимает каталог, сделанный prepare_slice.py; возвращает (h, meta).
+    Принимает каталог, сделанный prepare_slice_rda.py; возвращает (h, meta).
+
+    Большой срез не влезает в один файл — ни в 30 МБ вложения, ни в 100 МБ
+    гита, — и производитель режет его ПО ДАЛЬНОСТИ на h_srez_00.npy,
+    h_srez_01.npy, … Имена, границы и sha256 лежат в meta.json; здесь куски
+    склеиваются обратно по axis=1.
+
+    Сверяется три вещи, и каждая ловит свою беду:
+
+      sha256 куска    файл дошёл целым, а не обрезанным на полпути;
+      границы стробов куски идут в том порядке и без пропуска;
+      forma из меты   склеенное совпало с тем, что записал производитель.
+
+    Молчаливая ошибка тут дороже любой другой: неверно склеенный срез
+    считается без единой жалобы и даёт неверные числа во всех этапах.
+
+    Старый паспорт, где `fail` — одна строка, читается как раньше: там
+    ни кусков, ни sha256 нет, и сверять нечего.
     """
-    h = np.load(directory / "h_srez.npy")
     meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+    data = meta.get("dannye", {})
+    parts = data.get("chasti")
+    if not parts:
+        names = data.get("fail") or "h_srez.npy"
+        names = [names] if isinstance(names, str) else list(names)
+        parts = [{"fail": n} for n in names]
+
+    pieces, expect = [], 0
+    for part in parts:
+        full = directory / part["fail"]
+        if not full.is_file():
+            sys.exit(f"нет куска {part['fail']}; в meta.json их "
+                     f"{len(parts)}, передавать надо все")
+        if part.get("sha256"):
+            digest = hashlib.sha256()
+            with open(full, "rb") as fp:
+                for chunk in iter(lambda: fp.read(2**20), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != part["sha256"]:
+                sys.exit(f"{part['fail']}: sha256 не сошлась — файл дошёл "
+                         "повреждённым или обрезанным, считать по нему нельзя")
+        if part.get("stolbcy") and part["stolbcy"][0] != expect:
+            sys.exit(f"{part['fail']}: начинается со строба "
+                     f"{part['stolbcy'][0]}, а предыдущий кончился на "
+                     f"{expect} — куски не в том порядке или один пропущен")
+        piece = np.load(full)
+        pieces.append(piece)
+        expect += piece.shape[1]
+
+    h = pieces[0] if len(pieces) == 1 else np.concatenate(pieces, axis=1)
+    forma = (meta.get("srez") or {}).get("forma")
+    if forma and list(h.shape) != list(forma):
+        sys.exit(f"склеилось {list(h.shape)}, а в паспорте {list(forma)}")
+    if len(pieces) > 1:
+        print(f"срез склеен из {len(pieces)} кусков, sha256 сошлась у всех")
     return h, meta
 
 
@@ -675,7 +727,7 @@ def main() -> int:
               "Смотрите -20 дБ и ISLR — это и есть хвосты, которые видно глазом.")
 
     print("\nЭнтропия обязана упасть — её алгоритм и минимизирует, это НЕ проверка.")
-    print("Независимо смотрит контраст и глаза: картинки рядом с h_srez.npy.")
+    print("Независимо смотрит контраст и глаза: картинки рядом со срезом.")
 
     try:
         import matplotlib

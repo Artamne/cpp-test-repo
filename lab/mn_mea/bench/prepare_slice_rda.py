@@ -30,6 +30,11 @@ stroby_m — наклонная дальность В МЕТРАХ, перево
     meta.json    Geometry и всё, что к нему полагается
     srez.png     картинка среза, посмотреть глазами
 
+Если срез не влезает в предел на один файл (MAX_PART_MB, по умолчанию 28 МБ),
+он режется по ДАЛЬНОСТИ на h_srez_00.npy, h_srez_01.npy, … Имена, границы и
+sha256 кусков пишутся в meta.json, и приём склеивает их сам. Предел задаётся
+аргументом chast_mb=ЧИСЛО — для канала, где вложение больше или меньше.
+
 Порядок функций — порядок выполнения:
 
     find_companions     найти vel-npz и check-json рядом с rda
@@ -41,6 +46,7 @@ stroby_m — наклонная дальность В МЕТРАХ, перево
     choose_slice        границы среза по дальности и по азимуту
     read_slice          прочитать окно и перевернуть в (азимут, дальность)
     to_range_doppler    h = ifft(g), чтобы fft(h) = g тождественно
+    save_parts          записать срез, при нужде разрезав по дальности
     build_meta          собрать Geometry и проверки
     main
 
@@ -55,6 +61,7 @@ stroby_m — наклонная дальность В МЕТРАХ, перево
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import math
 import os
@@ -99,6 +106,12 @@ ENERGY_WARN_RATIO = 3.0
 #: Процентили для границ показа. Не нормировка по максимуму: см.
 #: display_window, там замер, почему максимум даёт чёрную картинку.
 DISPLAY_LOW, DISPLAY_HIGH = 5.0, 97.0
+
+#: Предел на ОДИН файл среза, мегабайты. Больше него срез режется на куски
+#: по дальности. Число не с потолка: чат принимает вложение до 30 МБ, GitHub
+#: отвергает файл больше 100 МБ, и 28 проходит в оба канала с запасом на
+#: заголовок .npy. Меняется аргументом chast_mb=.
+MAX_PART_MB = 28.0
 
 C_LIGHT = 299_792_458.0
 OUT_NAME = "mn_mea_srez"
@@ -493,11 +506,61 @@ def image_entropy(image: np.ndarray) -> float:
     return -float(np.sum(P * np.log(P))) / S_g + math.log(S_g)
 
 
+def save_parts(h: np.ndarray, out_dir: str, limit_mb: float) -> list[dict]:
+    """Положить срез на диск, при нужде разрезав на куски.
+
+    Принимает массив (азимут, дальность), каталог и предел на файл в
+    мегабайтах; возвращает список кусков: имя, стробы, размер, sha256.
+
+    РЕЖЕТСЯ ПО ДАЛЬНОСТИ, и это не безразлично. В (5-3) преобразование идёт
+    по азимуту, строб от строба независим: столбец — своя одномерная задача,
+    и разрез между столбцами ничего не портит. По азимуту там апертура,
+    разрыв посреди неё испортил бы сам предмет счёта.
+
+    Один кусок — файл зовётся h_srez.npy, как и раньше. Несколько —
+    h_srez_00.npy, h_srez_01.npy, …; порядок имён есть порядок склейки.
+    Старые куски от прошлого прогона удаляются: иначе h_srez_03.npy от
+    широкого среза приклеится к узкому и даст молча неверную картинку.
+
+    sha256 считается по файлу целиком. Он нужен на приёме: вложение может
+    прийти обрезанным, и лучше узнать об этом сразу, чем искать потом
+    причину странных чисел в этапе C.
+    """
+    for stale in sorted(glob.glob(os.path.join(out_dir, "h_srez*.npy"))):
+        os.remove(stale)
+
+    column = h.itemsize * h.shape[0]
+    limit_bytes = int(limit_mb * 2**20)
+    if column > limit_bytes:
+        print(f"  ВНИМАНИЕ: один строб это {column/2**20:.2f} МБ, а предел на "
+              f"файл {limit_mb:.1f} МБ. Мельче одного строба резать нечего — "
+              "куски выйдут больше предела. Укорачивайте срез по азимуту "
+              "(impulsy=) или поднимайте предел (chast_mb=).")
+    per_part = max(limit_bytes // max(column, 1), 1)
+    n_parts = max(int(math.ceil(h.shape[1] / per_part)), 1)
+    edges = [int(round(i * h.shape[1] / n_parts)) for i in range(n_parts + 1)]
+
+    parts: list[dict] = []
+    for i in range(n_parts):
+        c0, c1 = edges[i], edges[i + 1]
+        name = "h_srez.npy" if n_parts == 1 else f"h_srez_{i:02d}.npy"
+        full = os.path.join(out_dir, name)
+        np.save(full, np.ascontiguousarray(h[:, c0:c1]))
+        digest = hashlib.sha256()
+        with open(full, "rb") as fp:
+            for chunk in iter(lambda: fp.read(2**20), b""):
+                digest.update(chunk)
+        parts.append({"fail": name, "stolbcy": [c0, c1],
+                      "bajt": os.path.getsize(full),
+                      "sha256": digest.hexdigest()})
+    return parts
+
+
 def build_meta(rda_path: str, passport: dict, check: dict, vel: dict,
                cut: dict, lambda_: float, rho_a: float, rho_src: str,
                gamma: float, gamma_src: str, prf: float,
                h: np.ndarray, resid: float, entropy: float,
-               y_m_over_R: float = 0.9) -> dict:
+               parts: list[dict], y_m_over_R: float = 0.9) -> dict:
     """Собрать Geometry, допущения и проверки в один словарь для meta.json.
 
     Ни одно число не назначено рукой: всё выведено из паспорта h5, матрицы
@@ -555,7 +618,10 @@ def build_meta(rda_path: str, passport: dict, check: dict, vel: dict,
                           "описывают апертуру радара, это разные числа",
         },
         "dannye": {
-            "fail": "h_srez.npy",
+            "fail": [p["fail"] for p in parts],
+            "chasti": parts,
+            "sklejka": "numpy.concatenate(куски, axis=1) в порядке списка; "
+                       "деление ТОЛЬКО по дальности, по азимуту массив цел",
             "dtype": "complex64",
             "oblast": "дальность-доплер",
             "pravilo": "g = numpy.fft.fft(h, axis=0)",
@@ -620,7 +686,17 @@ def main() -> None:
     rda = sys.argv[1]
     if not os.path.isfile(rda):
         sys.exit(f"нет файла {rda}")
-    window_words = sys.argv[2:]
+    window_words, limit_mb = [], MAX_PART_MB
+    for word in sys.argv[2:]:
+        if word.startswith("chast_mb="):
+            try:
+                limit_mb = float(word.partition("=")[2])
+            except ValueError:
+                sys.exit(f"не разобрать {word!r}; ожидалось chast_mb=ЧИСЛО")
+            if limit_mb <= 0:
+                sys.exit("chast_mb должно быть больше нуля")
+        else:
+            window_words.append(word)
     out_dir = os.path.join(os.path.dirname(rda), OUT_NAME)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -729,9 +805,9 @@ def main() -> None:
     print(f"  сверка fft(h) == g: {resid:.2e} относительно")
     print(f"  нормированная энтропия среза: {S:.4f}")
 
-    np.save(os.path.join(out_dir, "h_srez.npy"), h)
+    parts = save_parts(h, out_dir, limit_mb)
     meta = build_meta(rda, passport, check, vel, cut, lambda_, rho_a,
-                      rho_src, gamma, gamma_src, prf, h, resid, S)
+                      rho_src, gamma, gamma_src, prf, h, resid, S, parts)
     with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as fp:
         json.dump(meta, fp, ensure_ascii=False, indent=2)
 
@@ -756,8 +832,16 @@ def main() -> None:
         print("  matplotlib нет, картинку пропустили")
 
     print(f"\nготово: {out_dir}")
-    print("  h_srez.npy   вход этапа A")
-    print("  meta.json    Geometry, допущения, проверки")
+    for p in parts:
+        print(f"  {p['fail']:<16} стробы {p['stolbcy'][0]} … "
+              f"{p['stolbcy'][1]}, {p['bajt']/2**20:.1f} МБ")
+    print("  meta.json        Geometry, допущения, проверки, sha256 кусков")
+    if len(parts) > 1:
+        print(f"\n  срез разрезан на {len(parts)} куска по дальности: целиком "
+              f"он {h.nbytes/2**20:.0f} МБ, а предел на файл {limit_mb:.0f} МБ.")
+        print("  Передавать НАДО ВСЕ куски и meta.json — приём склеит их сам "
+              "и сверит sha256.")
+        print("  Предел меняется аргументом chast_mb=ЧИСЛО.")
     print("  srez.png     на что смотреть глазами")
 
 
