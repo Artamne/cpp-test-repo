@@ -31,17 +31,77 @@
   },
   "dannye": {
     "fail": [
-      "h_srez.npy"
+      "h_srez_00.npy",
+      "h_srez_01.npy",
+      "h_srez_02.npy",
+      "h_srez_03.npy",
+      "h_srez_04.npy",
+      "h_srez_05.npy",
+      "h_srez_06.npy"
     ],
     "chasti": [
       {
-        "fail": "h_srez.npy",
+        "fail": "h_srez_00.npy",
         "stolbcy": [
           0,
+          809
+        ],
+        "bajt": 47161592,
+        "sha256": "657a05daf274d88e322aa24e42827c2bd1fc6799ce9d8254585333efffb7509a"
+      },
+      {
+        "fail": "h_srez_01.npy",
+        "stolbcy": [
+          809,
+          1617
+        ],
+        "bajt": 47103296,
+        "sha256": "43c13ff0931228e6d603393f44bb754e439ddebca24f5a57e2f502420494cd50"
+      },
+      {
+        "fail": "h_srez_02.npy",
+        "stolbcy": [
+          1617,
+          2426
+        ],
+        "bajt": 47161592,
+        "sha256": "bac48aa52010ef85ca8123b69d6292fe48190c1578552e2298240d8cd5c5d515"
+      },
+      {
+        "fail": "h_srez_03.npy",
+        "stolbcy": [
+          2426,
+          3234
+        ],
+        "bajt": 47103296,
+        "sha256": "d6a942c1b72cf8a69e48e1639b23e0fe9c61d51b7a3122ff9bf9f1fd4e201733"
+      },
+      {
+        "fail": "h_srez_04.npy",
+        "stolbcy": [
+          3234,
+          4043
+        ],
+        "bajt": 47161592,
+        "sha256": "5400da9b95e3949075844bfc93fe018a44acfd5ad1e0e296a28be988dab93d12"
+      },
+      {
+        "fail": "h_srez_05.npy",
+        "stolbcy": [
+          4043,
+          4851
+        ],
+        "bajt": 47103296,
+        "sha256": "61fd63afbd96b3ff6c7b21100a868409eb0e347510458295405b2dbc1586d1f0"
+      },
+      {
+        "fail": "h_srez_06.npy",
+        "stolbcy": [
+          4851,
           5660
         ],
-        "bajt": 329955488,
-        "sha256": "36dc1cda6979f6c440c67e702af3928ac4068db14a8f0982e989d9f641a7efb8"
+        "bajt": 47161592,
+        "sha256": "99e1138816982c568d18dd49764aba8093465d069898e8f5d9513a816fd1fc8c"
       }
     ],
     "sklejka": "numpy.concatenate(куски, axis=1) в порядке списка; деление ТОЛЬКО по дальности, по азимуту массив цел",
