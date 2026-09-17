@@ -23,6 +23,7 @@
     read_velocity       матрица скорости: выбрать согласную зону
     narrow_velocity     пересчитать скорость по ячейкам ВНУТРИ среза
     range_axis_metres   ось дальности в метрах
+    azimuth_energy      прореженный профиль энергии по азимуту
     choose_slice        границы среза по дальности и по азимуту
     read_slice          прочитать окно и перевернуть в (азимут, дальность)
     to_range_doppler    h = ifft(g), чтобы fft(h) = g тождественно
@@ -70,6 +71,16 @@ GAMMA_WIN_DEFAULT = 1.3
 #: `sar_core.resolution.DEFAULT_AZIMUTH_RESOLUTION_M`: там прямо написано, что
 #: это умолчание продукта, паспортом не подтверждённое.
 RESOLUTION_DEFAULT_M = 0.4
+
+#: Прореживание обзорного чтения по азимуту: каждый SURVEY_STEP-й импульс.
+#: Нужно только затем, чтобы увидеть, где на кадре сцена, а где пусто, — для
+#: этого разрешение не требуется, а читать кадр целиком незачем.
+SURVEY_STEP = 64
+
+#: Во сколько раз энергия лучшего окна должна превышать энергию окна,
+#: назначенного матрицей скорости, чтобы сказать об этом вслух. Не отказ и не
+#: подмена: просто предупреждение, что срез встал не туда, где сцена.
+ENERGY_WARN_RATIO = 3.0
 
 C_LIGHT = 299_792_458.0
 OUT_NAME = "mn_mea_srez"
@@ -258,9 +269,27 @@ def range_axis_metres(passport: dict, check: dict, ka_dir: str) -> np.ndarray:
     return r0 + r_b * np.arange(passport["shape"][0], dtype=np.float64)
 
 
+def azimuth_energy(rda_path: str, r0: int, r1: int) -> tuple[np.ndarray, int]:
+    """Прореженный профиль энергии по азимуту в выбранных стробах.
+
+    Принимает путь и границы по дальности; возвращает (профиль, прореживание).
+
+    Читается каждый SURVEY_STEP-й импульс — этого хватает, чтобы увидеть, где
+    сцена, а где пустой участок записи, и не хватает, чтобы съесть память.
+    Нужен затем, что положение среза по азимуту иначе назначается матрицей
+    скорости вслепую, а её индекс, как выяснилось на второй записи, может
+    жить в другой системе отсчёта.
+    """
+    import h5py
+
+    with h5py.File(rda_path, "r") as f:
+        block = f["array"][r0:r1, ::SURVEY_STEP]
+    return np.mean(np.abs(np.asarray(block)) ** 2, axis=0), SURVEY_STEP
+
+
 def choose_slice(R_axis: np.ndarray, vel: dict, n_az: int,
                  prf: float, lambda_: float, rho_a: float,
-                 gamma: float) -> dict:
+                 gamma: float, rda_path: str | None = None) -> dict:
     """Границы среза по дальности и по азимуту.
 
     Принимает ось дальности, выбор скорости, число импульсов кадра, PRF,
@@ -271,8 +300,18 @@ def choose_slice(R_axis: np.ndarray, vel: dict, n_az: int,
         M    = T_a * PRF                              импульсов в апертуре
 
     Окно по дальности — +-RANGE_HALF_FRACTION от R_B0 (см. настройку).
-    Окно по азимуту — M импульсов вокруг центра согласных ячеек скорости,
-    подвинутое внутрь кадра, если упёрлось в край.
+
+    Окно по азимуту ставится вокруг центра согласных ячеек скорости — но
+    ТОЛЬКО если этот индекс вообще принадлежит кадру. На второй записи
+    владельца `az_bin` доходил до 62480 при 4608 импульсах в кадре: матрица
+    скорости индексирует ПОЛНУЮ запись, а rda-файл — её кусок, и смещения
+    куска в паспорте нет. Окно тогда упиралось в край, срез вставал в хвост
+    кадра, и фокусировать было нечего: контраст 2,88 -> 2,89.
+
+    Поэтому: индекс вне кадра — окно ставится ПО ЭНЕРГИИ, туда, где на кадре
+    есть сцена. Индекс в кадре — он и берётся, но энергия его окна всё равно
+    сравнивается с лучшей, и о разнице говорится вслух. Выдумывать смещение
+    куска нельзя, а смотреть на пустое место бессмысленно.
     """
     n_r = R_axis.size
     r_b = float(np.mean(np.diff(R_axis)))
@@ -285,10 +324,30 @@ def choose_slice(R_axis: np.ndarray, vel: dict, n_az: int,
     T_a = gamma * lambda_ * R_B0 / (2.0 * rho_a * vel["v"])
     M = int(round(T_a * prf))
     M = min(M, n_az)
-    a0 = int(vel["az_bin"] - M // 2)
-    a0 = min(max(a0, 0), n_az - M)
+
+    in_frame = 0 <= vel["az_bin"] < n_az
+    a0 = min(max(int(vel["az_bin"] - M // 2), 0), n_az - M)
+    source = "матрица скорости" if in_frame else "энергия кадра"
+
+    energy_here = energy_best = a0_best = None
+    if rda_path is not None:
+        profile, step = azimuth_energy(rda_path, r0, r1)
+        width = max(1, M // step)
+        cumulative = np.concatenate([[0.0], np.cumsum(profile)])
+        sums = (cumulative[width:] - cumulative[:-width]) / width
+        a0_best = min(int(np.argmax(sums)) * step, n_az - M)
+        energy_best = float(sums.max())
+        energy_here = float(np.mean(profile[a0 // step : a0 // step + width]))
+        if not in_frame:
+            a0 = a0_best
+            energy_here = energy_best
+
     return {"r0": r0, "r1": r1, "a0": a0, "a1": a0 + M,
-            "R_B0": R_B0, "r_b": r_b, "T_a": T_a, "M_aperture": int(round(T_a * prf))}
+            "R_B0": R_B0, "r_b": r_b, "T_a": T_a,
+            "M_aperture": int(round(T_a * prf)),
+            "az_source": source, "az_in_frame": in_frame,
+            "a0_best": a0_best, "energy_here": energy_here,
+            "energy_best": energy_best}
 
 
 def read_slice(rda_path: str, cut: dict) -> np.ndarray:
@@ -388,6 +447,9 @@ def build_meta(rda_path: str, passport: dict, check: dict, vel: dict,
         "srez": {
             "stroby": [cut["r0"], cut["r1"]],
             "impulsy": [cut["a0"], cut["a1"]],
+            "polozhenie_po": cut["az_source"],
+            "energiya_okna": cut["energy_here"],
+            "energiya_luchshaya": cut["energy_best"],
             "forma": list(h.shape),
             "zamechanie": "M — длина массива по азимуту; M_aperture и T_a "
                           "описывают апертуру радара, это разные числа",
@@ -507,13 +569,18 @@ def main() -> None:
     print(f"  взято {vel['v']:.3f} м/с, центр по азимуту {vel['az_bin']}")
 
     cut = choose_slice(R_axis, vel, passport["shape"][1], prf, lambda_,
-                       rho_a, gamma)
+                       rho_a, gamma, rda)
+    if not cut["az_in_frame"]:
+        print(f"\n  ВНИМАНИЕ: az_bin = {vel['az_bin']} не принадлежит кадру "
+              f"(импульсов всего {passport['shape'][1]}). Матрица скорости "
+              "индексирует полную запись, а это её кусок, и смещения куска в "
+              "паспорте нет. Окно по азимуту поставлено ПО ЭНЕРГИИ.")
     vel = narrow_velocity(vel, cut["a0"], cut["a1"])
     if vel.get("narrowed"):
         print(f"  внутри окна {vel['kept_inside']} ячеек, скорость по ним "
               f"{vel['v']:.3f} м/с (по всей зоне было {vel['v_wide']:.3f})")
         cut = choose_slice(R_axis, vel, passport["shape"][1], prf, lambda_,
-                           rho_a, gamma)
+                           rho_a, gamma, rda)
     else:
         print("  ВНИМАНИЕ: внутри окна нет ни одной ячейки скорости; взята "
               "скорость по всей зоне, она может описывать не этот срез")
@@ -521,7 +588,17 @@ def main() -> None:
     print(f"  R_B0 = {cut['R_B0']:.1f} м, T_a = {cut['T_a']:.4f} с, "
           f"M_aperture = {cut['M_aperture']}")
     print(f"  стробы   {cut['r0']} … {cut['r1']}  ({cut['r1']-cut['r0']})")
-    print(f"  импульсы {cut['a0']} … {cut['a1']}  ({cut['a1']-cut['a0']})")
+    print(f"  импульсы {cut['a0']} … {cut['a1']}  ({cut['a1']-cut['a0']}), "
+          f"положение по: {cut['az_source']}")
+    if cut["energy_best"]:
+        ratio = cut["energy_best"] / max(cut["energy_here"], 1e-30)
+        print(f"  энергия окна {cut['energy_here']:.4g}, лучшая на кадре "
+              f"{cut['energy_best']:.4g} (в {ratio:.1f} раза) при a0 = "
+              f"{cut['a0_best']}")
+        if ratio > ENERGY_WARN_RATIO:
+            print(f"  ВНИМАНИЕ: срез стоит там, где энергии в {ratio:.1f} раза "
+                  "меньше, чем в лучшем месте кадра. Фокусировать, возможно, "
+                  "нечего — посмотрите srez.png")
 
     g = read_slice(rda, cut)
     h = to_range_doppler(g)
