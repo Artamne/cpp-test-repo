@@ -76,6 +76,22 @@ MAP_TILES_M, MAP_TILES_N = 16, 8
 #: этого, и такой пик уже не случайность.
 MAP_PEAK_OVER_MEDIAN_DB = 20.0
 
+#: На сколько децибел пик СРЕЗА должен превышать медиану ЭТОГО ЖЕ СРЕЗА,
+#: чтобы ширину по -20 дБ вообще можно было измерить.
+#:
+#: Это не украшение, а исправление настоящей ошибки. Медиана плитки —
+#: негодный отсчёт: плитка бывает наполовину водой, наполовину лесом, её
+#: медиана низка, и яркий спекл леса проходит порог, не будучи целью.
+#: Ширина отклика у спекла — случайное число, и карта показывала его как
+#: размаз. Поверка вскрыла это сразу: на ИДЕАЛЬНО сфокусированной картинке
+#: карта давала отношение 34,4 и ширину 47,9 элемента вместо 1 и 1,8, а с
+#: ростом внесённой ошибки числа скакали без порядка: 34,4 -> 4,5 -> 20,6.
+#:
+#: Правильный отсчёт — медиана самого среза: если пик не выше её на 20 дБ,
+#: то уровень -20 дБ лежит ВНУТРИ фона, и пересечение с ним не имеет
+#: отношения к отклику цели.
+CUT_DYNAMIC_DB = 20.0
+
 
 def find_targets(image: np.ndarray, cells: float, count: int,
                  window: int) -> list[tuple[int, int]]:
@@ -209,6 +225,19 @@ def islr(profile: np.ndarray, cells: float, factor: int = OVERSAMPLE) -> float:
     return 10.0 * np.log10(max(power.sum() - inside, 1e-300) / max(inside, 1e-300))
 
 
+def usable_cut(profile: np.ndarray, level_db: float = CUT_DYNAMIC_DB) -> bool:
+    """Годится ли срез для замера ширины на уровне -level_db.
+
+    Принимает уплотнённый профиль; возвращает True, если пик выше медианы
+    среза на level_db. Иначе уровень тонет в фоне и ширина бессмысленна —
+    см. CUT_DYNAMIC_DB, там разбор ошибки, которую это ловит.
+    """
+    med = float(np.median(profile))
+    if med <= 0.0:
+        return True
+    return 20.0 * np.log10(float(profile.max()) / med) >= level_db
+
+
 def measure_target(image: np.ndarray, m: int, n: int, cells: float,
                    window: int) -> dict:
     """Все числа по одной цели."""
@@ -228,6 +257,7 @@ def measure_target(image: np.ndarray, m: int, n: int, cells: float,
         # отсюда не видно (см. range_cut)
         "range_3db": width_at(across, -3.0, 1.0),
         "range_20db": width_at(across, -20.0, 1.0),
+        "usable": usable_cut(profile) and usable_cut(across),
         "profile": profile,
     }
 
@@ -296,6 +326,10 @@ def smear_map(image: np.ndarray, cells: float, r_a: float, r_b: float,
                 continue
             profile = upsample(azimuth_cut(image, m, n, window))
             across = upsample(range_cut(image, m, n, max(window // 4, 8)))
+            # уровень -20 дБ обязан лежать ВЫШЕ фона среза, иначе меряется
+            # не отклик цели, а спекл; см. CUT_DYNAMIC_DB
+            if not (usable_cut(profile) and usable_cut(across)):
+                continue
             islr_map[i, j] = islr(profile, cells)
             width_map[i, j] = width_at(profile, -20.0, cells)
             along_m = width_map[i, j] * r_a          # элементы разрешения -> метры
