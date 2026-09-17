@@ -29,6 +29,7 @@
     measure_target      все числа по одной цели
     measure             таблица по картинке
     compare             та же таблица для двух картинок, до и после
+    smear_map           КАРТА размаза по всей картинке, плиткой
 """
 
 from __future__ import annotations
@@ -62,6 +63,18 @@ MAINLOBE_CELLS = 1.0
 #: по азимуту в элементах разрешения, по дальности в стробах.
 GUARD_CELLS = 8.0
 GUARD_GATES = 4
+
+#: Сколько плиток по азимуту и по дальности в карте размаза. Плитка должна
+#: быть шире двух окон замера по азимуту, иначе отклик не помещается; при
+#: 6684 отсчётах и окне 168 это даёт потолок около двадцати плиток.
+MAP_TILES_M, MAP_TILES_N = 16, 8
+
+#: Во сколько раз самый яркий пиксель плитки должен превышать её медиану,
+#: чтобы считать его целью, а не выбросом спекла. У экспоненциально
+#: распределённой интенсивности отношение максимума из десятков тысяч
+#: отсчётов к медиане само по себе доходит до 15 дБ; 20 дБ — заведомо выше
+#: этого, и такой пик уже не случайность.
+MAP_PEAK_OVER_MEDIAN_DB = 20.0
 
 
 def find_targets(image: np.ndarray, cells: float, count: int,
@@ -216,6 +229,52 @@ def measure(image: np.ndarray, cells: float, count: int = 8) -> list[dict]:
     window = int(round(WINDOW_CELLS * cells))
     return [measure_target(image, m, n, cells, window)
             for m, n in find_targets(image, cells, count, window)]
+
+
+def smear_map(image: np.ndarray, cells: float,
+              tiles_m: int = MAP_TILES_M, tiles_n: int = MAP_TILES_N):
+    """КАРТА размаза: ISLR самой яркой цели в каждой плитке картинки.
+
+    Принимает картинку, ширину элемента разрешения в отсчётах и разбиение;
+    возвращает (карта ISLR, карта ширины по -20 дБ) — два массива
+    (tiles_m, tiles_n) с NaN там, где годной цели не нашлось.
+
+    Зачем. Таблица по восьми самым ярким целям отвечает на вопрос «каковы
+    лучшие цели», а не «где картинка размазана». На записи владельца семь
+    из восьми оказались в одном месте, и весь остальной кадр остался
+    неизмеренным — а размаз он видел глазом именно там.
+
+    В каждой плитке берётся её самый яркий пиксель. Если он не превышает
+    медиану плитки на MAP_PEAK_OVER_MEDIAN_DB, цели в плитке нет (гладкое
+    поле, вода) и в карту идёт NaN: мерить ширину отклика у спекла
+    бессмысленно, ответ был бы случайным числом.
+    """
+    a = np.abs(np.asarray(image))
+    M, N = a.shape
+    window = int(round(WINDOW_CELLS * cells))
+    edges_m = np.linspace(0, M, tiles_m + 1).astype(int)
+    edges_n = np.linspace(0, N, tiles_n + 1).astype(int)
+    islr_map = np.full((tiles_m, tiles_n), np.nan)
+    width_map = np.full((tiles_m, tiles_n), np.nan)
+
+    for i in range(tiles_m):
+        for j in range(tiles_n):
+            tile = a[edges_m[i]:edges_m[i+1], edges_n[j]:edges_n[j+1]]
+            if tile.size == 0:
+                continue
+            local = np.unravel_index(int(np.argmax(tile)), tile.shape)
+            m = edges_m[i] + int(local[0])
+            n = edges_n[j] + int(local[1])
+            if not (window <= m < M - window):
+                continue
+            over = 20.0 * np.log10(max(tile.max(), 1e-300) /
+                                   max(float(np.median(tile)), 1e-300))
+            if over < MAP_PEAK_OVER_MEDIAN_DB:
+                continue
+            profile = upsample(azimuth_cut(image, m, n, window))
+            islr_map[i, j] = islr(profile, cells)
+            width_map[i, j] = width_at(profile, -20.0, cells)
+    return islr_map, width_map
 
 
 def compare(before: np.ndarray, after: np.ndarray, cells: float,

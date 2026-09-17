@@ -720,6 +720,37 @@ def main() -> int:
             cuts = directory / "mn_mea_srezy.png"
             fig.savefig(cuts, dpi=120)
             print(f"срезы:    {cuts}")
+
+        # карта размаза: где по кадру он есть, а где нет. Таблица отвечает
+        # «каковы лучшие цели», карта — «где картинка размазана», и это
+        # разные вопросы
+        islr_before, width_before = smear.smear_map(before, cells)
+        islr_after, width_after = smear.smear_map(after, cells)
+        if np.isfinite(islr_before).any():
+            fig, axes = plt.subplots(1, 2, figsize=(13, 6), sharey=True)
+            lo = float(np.nanmin([islr_before, islr_after]))
+            hi = float(np.nanmax([islr_before, islr_after]))
+            for ax, data, name in ((axes[0], islr_before, "до"),
+                                   (axes[1], islr_after, "после")):
+                im = ax.imshow(data, aspect="auto", cmap="inferno",
+                               vmin=lo, vmax=hi, origin="upper",
+                               extent=[0, after.shape[1], after.shape[0], 0])
+                ax.set_title(f"{name}, медиана ISLR "
+                             f"{np.nanmedian(data):.2f} дБ")
+                ax.set_xlabel("строб дальности n")
+            axes[0].set_ylabel("азимут m")
+            fig.colorbar(im, ax=axes, label="ISLR, дБ — ярче значит размазаннее")
+            fig.suptitle("Карта размаза: ISLR самой яркой цели в каждой плитке. "
+                         f"Норма -9,7 дБ; пусто — цели нет ({np.isnan(islr_before).sum()} "
+                         f"плиток из {islr_before.size})")
+            out_map = directory / "mn_mea_karta.png"
+            fig.savefig(out_map, dpi=120)
+            print(f"карта:    {out_map}")
+            print(f"\nПО КАРТЕ: ISLR медиана {np.nanmedian(islr_before):.2f} -> "
+                  f"{np.nanmedian(islr_after):.2f} дБ, худшая плитка "
+                  f"{np.nanmax(islr_before):.2f} -> {np.nanmax(islr_after):.2f}, "
+                  f"ширина -20 дБ медиана {np.nanmedian(width_before):.2f} -> "
+                  f"{np.nanmedian(width_after):.2f} элемента")
     except ImportError:
         print("matplotlib нет, картинку пропустили")
     return 0
