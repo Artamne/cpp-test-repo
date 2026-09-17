@@ -99,6 +99,14 @@ SMEAR_TARGETS = 8
 #: читаются; больше — уже мелко.
 SMEAR_CUTS = 4
 
+#: Полуокно крупного плана вокруг цели, в элементах разрешения. На общем
+#: плане кадра 11000 строк ужаты в 600 пикселей — 18 строк на пиксель, и
+#: сужение пятна с 50 до 30 отсчётов там не видно в принципе. Крупный план
+#: 1:1: +-12 элементов = +-84 строки накрывают хвост даже у самой широкой
+#: цели (-20 дБ до 13 элементов до автофокуса). По дальности берётся
+#: столько же МЕТРОВ, чтобы квадрат на экране был квадратом на земле.
+KRUPNO_CELLS = 12.0
+
 
 #: Контраст однородного полностью развитого спекла. Не подгонка, а точное
 #: значение: у комплексно-гауссова поля интенсивность распределена
@@ -821,6 +829,41 @@ def main() -> int:
             cuts = directory / "mn_mea_srezy.png"
             fig.savefig(cuts, dpi=120)
             print(f"срезы:    {cuts}")
+
+        # крупный план 1:1 вокруг тех же целей: общий план кадра сужения
+        # пятна показать не может (см. KRUPNO_CELLS), а здесь оно видно
+        if shown:
+            half_m = int(round(KRUPNO_CELLS * cells))
+            half_n = max(int(round(KRUPNO_CELLS * geom.r_a / geom.r_b)), 4)
+            # imshow: aspect = высота строки / ширина столбца на экране; строка
+            # 0,057 м, столбец 0,30 м -> 0,19, тогда метр по азимуту равен
+            # метру по дальности (первая версия ставила обратное, панели
+            # выходили лентами в 5 раз выше, чем надо)
+            aspect = geom.azimuth_step / geom.r_b
+            fig, axes = plt.subplots(2, len(shown), figsize=(3.6 * len(shown), 7.6),
+                                     squeeze=False)
+            for j, row in enumerate(shown):
+                m0, n0 = row["m"], row["n"]
+                m_lo, m_hi = max(m0 - half_m, 0), min(m0 + half_m, before.shape[0])
+                n_lo, n_hi = max(n0 - half_n, 0), min(n0 + half_n, before.shape[1])
+                # уровень в дБ от пика цели ДО, общий для обеих картинок
+                peak = float(np.abs(before[m0, n0]))
+                for i, (image, name) in enumerate(((before, "до"), (after, "после"))):
+                    patch = np.abs(image[m_lo:m_hi, n_lo:n_hi])
+                    db = 20 * np.log10(np.maximum(patch / max(peak, 1e-300), 1e-6))
+                    ax = axes[i][j]
+                    ax.imshow(db, cmap="gray", vmin=-35, vmax=0, aspect=aspect,
+                              extent=[n_lo, n_hi, m_hi, m_lo])
+                    ax.set_title(f"{name} {m0},{n0}: -20 дБ "
+                                 f"{row[name == 'до' and 'before' or 'after']['width_20db']:.1f} эл.",
+                                 fontsize=10)
+                    ax.set_xlabel("строб"); ax.set_ylabel("азимут")
+            fig.suptitle(f"Крупный план 1:1, +-{KRUPNO_CELLS:g} элементов "
+                         f"({2*half_m} строк x {2*half_n} стробов), дБ от пика цели до")
+            fig.tight_layout()
+            krupno = directory / "mn_mea_krupno.png"
+            fig.savefig(krupno, dpi=120)
+            print(f"крупно:   {krupno}")
 
         # карта размаза: где по кадру он есть, а где нет. Таблица отвечает
         # «каковы лучшие цели», карта — «где картинка размазана», и это
