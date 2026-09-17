@@ -167,8 +167,16 @@ def width_at(profile: np.ndarray, level_db: float, cells: float,
     разрешения, а не в отсчётах и не в метрах, потому что осмысленно
     сравнивать надо с единицей: у сфокусированной цели ширина по -3 дБ
     равна 0,886 элемента, и всякое «в полтора раза шире» видно сразу.
+
+    ПИК НА КРАЮ СРЕЗА — отказ, возвращается NaN. Хвост с такой стороны
+    обрезан, и ширина занизилась бы, а то и вышла нулём: цикл поиска
+    пересечения не смог бы сделать ни шага. Первая версия этого не
+    проверяла, и карта отношения азимут/дальность показывала 2e12 — деление
+    на такой ноль.
     """
     peak = int(np.argmax(profile))
+    if peak == 0 or peak == profile.size - 1:
+        return float("nan")
     threshold = profile[peak] * 10.0 ** (level_db / 20.0)
 
     def crossing(direction: int) -> float:
@@ -231,13 +239,27 @@ def measure(image: np.ndarray, cells: float, count: int = 8) -> list[dict]:
             for m, n in find_targets(image, cells, count, window)]
 
 
-def smear_map(image: np.ndarray, cells: float,
+def smear_map(image: np.ndarray, cells: float, r_a: float, r_b: float,
               tiles_m: int = MAP_TILES_M, tiles_n: int = MAP_TILES_N):
-    """КАРТА размаза: ISLR самой яркой цели в каждой плитке картинки.
+    """КАРТА размаза: где картинка растянута по азимуту, а где нет.
 
-    Принимает картинку, ширину элемента разрешения в отсчётах и разбиение;
-    возвращает (карта ISLR, карта ширины по -20 дБ) — два массива
-    (tiles_m, tiles_n) с NaN там, где годной цели не нашлось.
+    Принимает картинку, ширину элемента разрешения в отсчётах, разрешение по
+    азимуту и шаг по дальности в метрах и разбиение; возвращает три массива
+    (tiles_m, tiles_n): ISLR, ширина по -20 дБ в элементах и ОТНОШЕНИЕ
+    ширины по азимуту к ширине по дальности, обе в метрах. NaN там, где
+    годной цели не нашлось.
+
+    ОТНОШЕНИЕ — главная из трёх карт, и вот почему. Расфокусировка
+    растягивает отклик ТОЛЬКО по азимуту: по дальности автофокус не работает
+    и фазовая ошибка туда не входит. Значит объект, широкий в обе стороны
+    одинаково, — просто такого размера (куст, дерево, угол здания), и его
+    ширина законна. А объект, вытянутый по азимуту в разы, размазан.
+
+    Замер на записи владельца, по восьми ярким целям: медиана отношения была
+    1,32 до автофокуса и стала 0,91 после — то есть там, где алгоритм
+    отработал, азимутальный избыток снят целиком и осталась собственная
+    ширина объектов. А цель в блоке, где алгоритм не работал, как имела
+    отношение 2,22, так и осталась.
 
     Зачем. Таблица по восьми самым ярким целям отвечает на вопрос «каковы
     лучшие цели», а не «где картинка размазана». На записи владельца семь
@@ -256,6 +278,7 @@ def smear_map(image: np.ndarray, cells: float,
     edges_n = np.linspace(0, N, tiles_n + 1).astype(int)
     islr_map = np.full((tiles_m, tiles_n), np.nan)
     width_map = np.full((tiles_m, tiles_n), np.nan)
+    ratio_map = np.full((tiles_m, tiles_n), np.nan)
 
     for i in range(tiles_m):
         for j in range(tiles_n):
@@ -272,9 +295,17 @@ def smear_map(image: np.ndarray, cells: float,
             if over < MAP_PEAK_OVER_MEDIAN_DB:
                 continue
             profile = upsample(azimuth_cut(image, m, n, window))
+            across = upsample(range_cut(image, m, n, max(window // 4, 8)))
             islr_map[i, j] = islr(profile, cells)
             width_map[i, j] = width_at(profile, -20.0, cells)
-    return islr_map, width_map
+            along_m = width_map[i, j] * r_a          # элементы разрешения -> метры
+            across_m = width_at(across, -20.0, 1.0) * r_b   # отсчёты -> метры
+            # ширина по дальности меньше половины отсчёта физически
+            # невозможна: отклик не может быть уже сетки. Значит замер
+            # негодный — пик у края среза или цель на границе кадра
+            if across_m > 0.5 * r_b:
+                ratio_map[i, j] = along_m / across_m
+    return islr_map, width_map, ratio_map
 
 
 def compare(before: np.ndarray, after: np.ndarray, cells: float,
