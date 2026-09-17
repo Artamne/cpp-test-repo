@@ -17,6 +17,10 @@
     faza=luchshaya  ОДНА фаза на всю сцену, взятая у блока, где энтропия
                     упала сильнее всех. По умолчанию faza=svoya — каждый
                     блок со своей, как в книге
+    celi=0.05       решение №9: критерий (5-5) считается только по
+                    окрестностям целей, а не по всему блоку. На местности
+                    без этого блок возвращает ноль: фон давит цели. По
+                    умолчанию выключено, поведение книжное
 
 ЧЕТВЁРТЫЙ АРГУМЕНТ — ПРОБА, и он отвечает на вопрос, который иначе не
 решается. Если прогон почти ничего не меняет, причин ровно две: остаточной
@@ -160,7 +164,7 @@ def parse_options(words: list[str]) -> tuple:
     порядок уже не ложится.
     """
     grid, mu, probe = None, MU_REAL, 0.0
-    iterations, shared = C.MAX_ITERATIONS, False
+    iterations, shared, targets = C.MAX_ITERATIONS, False, None
     bare = 0
     for word in words:
         if "=" in word:
@@ -174,13 +178,15 @@ def parse_options(words: list[str]) -> tuple:
                 probe = float(value)
             elif name == "iter":
                 iterations = int(value)
+            elif name == "celi":
+                targets = float(value)
             elif name == "faza":
                 if value not in ("svoya", "luchshaya"):
                     sys.exit(f"faza={value}: есть svoya и luchshaya")
                 shared = value == "luchshaya"
             else:
                 sys.exit(f"неизвестный аргумент {name!r}; есть setka, mu, "
-                         "proba, iter, faza")
+                         "proba, iter, faza, celi")
         elif re.fullmatch(r"\d+[xX]\d+", word):
             a, b = word.lower().split("x")
             grid = (int(a), int(b))
@@ -193,7 +199,7 @@ def parse_options(words: list[str]) -> tuple:
             else:
                 sys.exit(f"лишнее число {word!r}: голыми идут только mu и проба")
             bare += 1
-    return grid, mu, probe, iterations, shared
+    return grid, mu, probe, iterations, shared, targets
 
 
 def read_slice(directory: pathlib.Path) -> tuple[np.ndarray, dict]:
@@ -252,7 +258,8 @@ def best_block(rows: list[dict]) -> dict | None:
 
 def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
           mu: float = MU_REAL, max_iterations: int = C.MAX_ITERATIONS,
-          shared_phase: bool = False) -> dict:
+          shared_phase: bool = False,
+          target_fraction: float | None = None) -> dict:
     """Собственно прогон: блоки, этап C из нуля, этап D.
 
     Принимает h, Geometry, сетку блоков (или None — тогда по (5-20)), порог
@@ -302,7 +309,8 @@ def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
         L = data.h.shape[0]
         result = C.iterate_block(backend, data.h, np.zeros(L), mu=mu,
                                  max_iterations=max_iterations,
-                                 core=(data.core_start, data.core_stop))
+                                 core=(data.core_start, data.core_stop),
+                                 target_fraction=target_fraction)
         rows.append({
             "q_k": block.q_k,
             "shape": block.shape,
@@ -518,7 +526,7 @@ def main() -> int:
         print(__doc__)
         return 2
     directory = pathlib.Path(sys.argv[1])
-    grid, mu, probe, iterations, shared = parse_options(sys.argv[2:])
+    grid, mu, probe, iterations, shared, targets = parse_options(sys.argv[2:])
 
     h, meta = read_slice(directory)
     geom = geometry_from_meta(meta)
@@ -543,10 +551,12 @@ def main() -> int:
         print(line)
 
     run = focus(h, geom, grid, mu=mu, max_iterations=iterations,
-                shared_phase=shared)
+                shared_phase=shared, target_fraction=targets)
     print(f"\nсетка блоков {run['M_k']}x{run['N_k']}, порог (5-9) mu = {mu:g}, "
           f"предел {iterations} итераций, начальная фаза нулевая "
-          f"(этап B не делается)")
+          f"(этап B не делается)"
+          + (f", критерий по целям ({100*targets:g} % стробов, решение №9)"
+             if targets else ""))
     if run["donor"] is not None:
         d = run["donor"]
         drops = sorted(r["entropy_before"] - r["entropy_after"]
@@ -596,7 +606,8 @@ def main() -> int:
               "Второй прогон, сверяется разность оценок.")
         spoiled = h * np.exp(-1j * phi_probe)[:, None].astype(h.dtype)
         run_probe = focus(spoiled, geom, grid, mu=mu,
-                          max_iterations=iterations, shared_phase=shared)
+                          max_iterations=iterations, shared_phase=shared,
+                          target_fraction=targets)
 
         print(f"\n{'блок':>5}{'внесено, рад':>14}{'осталось, рад':>15}"
               f"{'снято':>8}")
