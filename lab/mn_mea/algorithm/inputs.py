@@ -214,14 +214,32 @@ def derived_numbers(geom: Geometry, M: int, N: int) -> dict[str, float]:
     укладывается в один блок — разбиение не нужно и ничего не даст. Сотни
     означают, что блок вышел крошечным: скорее всего перепутаны единицы в
     r_a или в ускорении.
+
+    Два числа считаются НЕ через длину среза M, и вот почему. Раньше стояло
+    prf_hz = M/T_a и scene_azimuth_m = M*r_a, и оба врали на реальном срезе:
+
+      * M/T_a верно лишь когда срез равен ровно одной апертуре. Владелец
+        вырезал 6684 отсчёта при апертуре 2840, и выходило 1838,9 Гц вместо
+        настоящих 781,25. Теперь PRF берётся из самой геометрии, как
+        скорость, делённая на шаг картинки: это тождество v/PRF = шаг, и
+        длина среза в него не входит;
+      * M*r_a умножало на РАЗРЕШЕНИЕ вместо ШАГА — та же путаница, что
+        когда-то сидела в (5-22). Протяжённость сцены выходила 2673,6 м
+        вместо 381,6, то есть в r_a/шаг = 7 раз больше.
+
+    Добавлено aperture_samples: сколько отсчётов в апертуре по паспорту.
+    Сравнив его с M, видно, срез это одна апертура или несколько.
     """
     coefficients = linearisation_coefficients(geom)
     x_p, y_p = block_half_sizes(coefficients, geom)
     m_p, n_p = block_sample_sizes(x_p, y_p, geom)
     M_k, N_k, q = block_counts(M, N, m_p, n_p)
+    speed = math.sqrt(geom.v_x0**2 + geom.v_y0**2 + geom.v_z0**2)
+    prf = speed / geom.azimuth_step
     return {
-        "prf_hz": M / geom.T_a,
-        "scene_azimuth_m": M * geom.r_a,
+        "prf_hz": prf,
+        "aperture_samples": prf * geom.T_a,
+        "scene_azimuth_m": M * geom.azimuth_step,
         "scene_range_m": N * geom.r_b,
         "block_half_azimuth_m": x_p,
         "block_half_range_m": y_p,
