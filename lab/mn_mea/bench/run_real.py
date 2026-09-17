@@ -59,12 +59,23 @@ import stage_c_iterate as C
 import stage_d_assemble as D
 from backend import get_backend
 from stage_a_blocks import Geometry
+import smear
 from validate import image_sharpness, phase_residual_rms, truth_on_block_grid
 
 
 #: Процентили для границ показа. Не нормировка по максимуму: см.
 #: display_window, там замер, почему максимум даёт чёрную картинку.
 DISPLAY_LOW, DISPLAY_HIGH = 5.0, 97.0
+
+#: Сколько самых ярких одиночных целей меряет линейка размаза. Восемь —
+#: чтобы медиана была устойчива к тому, что одна-две «цели» окажутся
+#: случайными выбросами спекла, и при этом таблица помещалась на экран.
+SMEAR_TARGETS = 8
+
+#: Сколько целей из них рисуется срезами. Четыре помещаются в строку и
+#: читаются; больше — уже мелко.
+SMEAR_CUTS = 4
+
 
 #: Контраст однородного полностью развитого спекла. Не подгонка, а точное
 #: значение: у комплексно-гауссова поля интенсивность распределена
@@ -490,6 +501,35 @@ def main() -> int:
             print("  * сцене нечего дать критерию — тогда и малая проба не "
                   "снимется. Смотрите, насколько картинка над спеклом.")
 
+    # ------------------------------------------------ линейка размаза
+    cells = geom.r_a / geom.azimuth_step
+    rows = smear.compare(before, after, cells, count=SMEAR_TARGETS)
+    if rows:
+        print(f"\nРАЗМАЗ по {len(rows)} самым ярким одиночным целям. Ширина в "
+              f"элементах разрешения (элемент = {cells:.1f} отсчёта);")
+        print("у сфокусированной цели -3 дБ = 0,886, ISLR около -9,7 дБ.")
+        print(f"\n{'цель m,n':>14}{'-3 дБ':>16}{'-10 дБ':>16}{'-20 дБ':>16}"
+              f"{'ISLR, дБ':>16}")
+        print(f"{'':14}{'до':>8}{'после':>8}{'до':>8}{'после':>8}"
+              f"{'до':>8}{'после':>8}{'до':>8}{'после':>8}")
+        for row in rows:
+            b, a = row["before"], row["after"]
+            print(f"{row['m']:>7},{row['n']:<6}"
+                  f"{b['width_3db']:>8.2f}{a['width_3db']:>8.2f}"
+                  f"{b['width_10db']:>8.2f}{a['width_10db']:>8.2f}"
+                  f"{b['width_20db']:>8.2f}{a['width_20db']:>8.2f}"
+                  f"{b['islr_db']:>8.2f}{a['islr_db']:>8.2f}")
+        med = lambda key, side: float(np.median(
+            [r[side][key] for r in rows]))
+        print(f"\n{'медиана':>14}"
+              f"{med('width_3db','before'):>8.2f}{med('width_3db','after'):>8.2f}"
+              f"{med('width_10db','before'):>8.2f}{med('width_10db','after'):>8.2f}"
+              f"{med('width_20db','before'):>8.2f}{med('width_20db','after'):>8.2f}"
+              f"{med('islr_db','before'):>8.2f}{med('islr_db','after'):>8.2f}")
+        print("\nШирину по -3 дБ при сильной расфокусировке читать нельзя: "
+              "главный лепесток разваливается, и уровень пересекается не там. "
+              "Смотрите -20 дБ и ISLR — это и есть хвосты, которые видно глазом.")
+
     print("\nЭнтропия обязана упасть — её алгоритм и минимизирует, это НЕ проверка.")
     print("Независимо смотрит контраст и глаза: картинки рядом с h_srez.npy.")
 
@@ -516,6 +556,37 @@ def main() -> int:
         out = directory / "mn_mea_do_posle.png"
         fig.savefig(out, dpi=120)
         print(f"картинка: {out}")
+
+        # срезы по азимуту через самые яркие цели: то же, что меряет
+        # линейка, но глазами. Уровень в дБ от собственного пика каждой
+        # цели, ось — в элементах разрешения от пика
+        shown = rows[:SMEAR_CUTS]
+        if shown:
+            fig, axes = plt.subplots(1, len(shown), figsize=(4 * len(shown), 4),
+                                     squeeze=False, sharey=True)
+            for ax, row in zip(axes[0], shown):
+                for side, colour, name in (("before", "0.55", "до"),
+                                           ("after", "C0", "после")):
+                    prof = row[side]["profile"]
+                    peak = int(np.argmax(prof))
+                    axis = (np.arange(prof.size) - peak) / (
+                        cells * smear.OVERSAMPLE)
+                    ax.plot(axis, 20 * np.log10(np.maximum(
+                        prof / prof.max(), 1e-4)), colour, label=name, lw=1.1)
+                ax.set_xlim(-8, 8)
+                ax.set_ylim(-45, 2)
+                ax.grid(alpha=0.25)
+                ax.set_title(f"цель {row['m']},{row['n']}\n"
+                             f"ISLR {row['before']['islr_db']:.1f} -> "
+                             f"{row['after']['islr_db']:.1f} дБ", fontsize=10)
+                ax.set_xlabel("элементы разрешения от пика")
+            axes[0][0].set_ylabel("дБ от пика")
+            axes[0][0].legend(loc="upper right", fontsize=9)
+            fig.suptitle("Отклик по азимуту: чем ниже хвосты, тем меньше размаз")
+            fig.tight_layout()
+            cuts = directory / "mn_mea_srezy.png"
+            fig.savefig(cuts, dpi=120)
+            print(f"срезы:    {cuts}")
     except ImportError:
         print("matplotlib нет, картинку пропустили")
     return 0
