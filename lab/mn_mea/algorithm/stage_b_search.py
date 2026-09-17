@@ -31,10 +31,11 @@
 
     band_axis          нормированная частота u: 0 вне полосы, +-1 на её краю
     legendre           многочлен Лежандра P_d(u)
-    polynomial_phase   phi(u) = sum c_d P_d(u) по степеням DEGREES
+    polynomial_phase   phi = sum c_d P_d(u) (R/R_B0)^(d-1) по степеням DEGREES
+    range_scale_axis   R_n / R_B0 по стробам
     scene_entropy      (5-6) по всей сцене при данной phi — одно БПФ
     refine_coefficient один коэффициент: перебор с шагом, потом парабола
-    search             грубая сетка по двум степеням, затем покоординатное уточнение
+    search             широкий скан квадратичной, сетка по двум степеням, уточнение
 """
 
 from __future__ import annotations
@@ -89,12 +90,37 @@ GRID_HALF_STEPS = 4
 #: замер с внесёнными 8 рад поверх собственных 10 — нашёл 14 из 18.
 EXTEND_LIMIT = 6
 
+#: Широкий предварительный скан ОДНОЙ квадратичной: полуширина в радианах
+#: и шаг. Ошибка скорости продукта в 10…15 % даёт квадратичную фазу в
+#: сотни радиан (при K_a = 38 Гц/с и T_a = 3,8 с полная фаза апертуры
+#: 436 рад, её десятая часть — 44), и сетка 9 x 9 с шагом 4 её не достаёт.
+#: Шаг 8: впадина энтропии при таких ошибках широкая, замер на срезе
+#: владельца — от -40 до +40 рад энтропия гладкая, одна впадина.
+PRESCAN_HALF_RAD = 320.0
+PRESCAN_STEP_RAD = 8.0
+
+#: Прореживание по дальности для предварительного скана: каждый такой
+#: строб. Энтропии как критерию хватает и четверти стробов — она среднее
+#: по миллионам пикселей, — а скан от этого вчетверо быстрее. Сетка и
+#: уточнение идут по всем стробам.
+PRESCAN_RANGE_STRIDE = 4
+
+#: Показатель степени дальности при коэффициенте d-й степени: фаза
+#: масштабируется как (R / R_B0) ** (d - 1). Вывод для ошибки скорости:
+#: остаток phi(f_d) = pi f_d^2 (1/K_ист - 1/K_взят), K = 2 v^2 / (lambda R),
+#: то есть при данной доплеровской частоте phi ~ R — квадратичная растёт
+#: с дальностью линейно (d - 1 = 1). Для ошибки продольного ускорения
+#: dR = v da t^3 / (2 R), t = -lambda R f_d / (2 v^2), откуда phi ~ R^2
+#: (d - 1 = 2). Без масштабирования одна поправка на срез в 1700 м по
+#: дальности (R от 2650 до 4350) ошибается на +-25 % по краям.
+RANGE_POWER_OFFSET = 1
+
 
 @dataclass
 class SearchResult:
     """Что нашёл поиск и по каким числам."""
 
-    phi: np.ndarray                              # phi^(0) на сетке сцены, длина M
+    phi: np.ndarray                              # phi^(0): длина M, или (M, N) с дальностью
     coefficients: dict[int, float]               # степень -> коэффициент, рад на краю
     entropy_start: float                         # (5-6) при phi = 0
     entropy_final: float                         # (5-6) при найденной phi
@@ -135,18 +161,38 @@ def legendre(u: np.ndarray, degree: int) -> np.ndarray:
     return p
 
 
-def polynomial_phase(u: np.ndarray, coefficients: dict[int, float]) -> np.ndarray:
-    """phi(u) = sum_d c_d P_d(u). Принимает ось u и словарь степень -> коэффициент.
+def polynomial_phase(u: np.ndarray, coefficients: dict[int, float],
+                     range_scale: np.ndarray | None = None) -> np.ndarray:
+    """phi(u) = sum_d c_d P_d(u), при range_scale — ещё и по дальности.
+
+    Принимает ось u, словарь степень -> коэффициент и, если есть, вектор
+    R_n / R_B0 по стробам; возвращает фазу длины M (без дальности) или
+    массив (M, N): phi(k, n) = sum_d c_d P_d(u_k) (R_n / R_B0)^(d - 1),
+    см. RANGE_POWER_OFFSET. Коэффициент c_d — фаза на краю полосы В ЦЕНТРЕ
+    среза по дальности, R = R_B0.
 
     Вне полосы u = 0, и P_d(0) для чётных d НЕ ноль — поэтому фаза вне
     полосы обнуляется явно: там сигнала нет, и фаза там ничего не значит.
     """
-    phi = np.zeros_like(u)
+    if range_scale is None:
+        phi = np.zeros_like(u)
+        for degree, c in coefficients.items():
+            if c != 0.0:
+                phi += c * legendre(u, degree)
+        phi[u == 0.0] = 0.0
+        return phi
+    phi = np.zeros((u.size, range_scale.size), dtype=np.float64)
     for degree, c in coefficients.items():
         if c != 0.0:
-            phi += c * legendre(u, degree)
-    phi[u == 0.0] = 0.0
+            phi += (c * legendre(u, degree))[:, None] * (
+                range_scale[None, :] ** (degree - RANGE_POWER_OFFSET))
+    phi[u == 0.0, :] = 0.0
     return phi
+
+
+def range_scale_axis(R_B0: float, r_b: float, N: int) -> np.ndarray:
+    """R_n / R_B0 по стробам: R_B0 в середине среза, шаг r_b метров на строб."""
+    return (R_B0 + (np.arange(N) - N / 2.0) * r_b) / R_B0
 
 
 def scene_entropy(backend: Backend, h, phi, S_g: float, floor: float) -> float:
@@ -159,7 +205,11 @@ def scene_entropy(backend: Backend, h, phi, S_g: float, floor: float) -> float:
     число, которое этап C будет минимизировать, только по всей сцене
     и без маски.
     """
-    _, g = C.image_from_phase(backend, h, backend.asarray(phi))
+    phi = backend.asarray(phi)
+    if phi.ndim == 1:
+        _, g = C.image_from_phase(backend, h, phi)
+    else:  # фаза зависит и от дальности: (5-3) построчно, множитель (M, N)
+        g = backend.fft_kernel_minus(h * backend.xp.exp(1j * phi))
     P, _, _ = C.image_power(backend, g, floor)
     return C.entropy(backend, P, S_g, None)[1]
 
@@ -216,18 +266,27 @@ def refine_coefficient(evaluate, coefficients: dict[int, float], degree: int,
 
 def search(backend: Backend, h, degrees=DEGREES, step_initial: float = STEP_INITIAL_RAD,
            rounds: int = ROUNDS, floor_factor: float = C.SIGNAL_FLOOR_FACTOR,
-           floor_relative: float = C.POWER_FLOOR_RELATIVE) -> SearchResult:
-    """Покоординатный спуск по коэффициентам полинома, по энтропии сцены.
+           floor_relative: float = C.POWER_FLOOR_RELATIVE,
+           range_scale: np.ndarray | None = None,
+           prescan_half: float = PRESCAN_HALF_RAD,
+           prescan_step: float = PRESCAN_STEP_RAD) -> SearchResult:
+    """Поиск полинома по энтропии сцены: широкий скан, сетка, уточнение.
 
-    Принимает бэкенд и данные сцены h(k,n); возвращает SearchResult с
-    phi^(0) на доплеровской сетке сцены.
+    Принимает бэкенд, данные сцены h(k,n) и, если есть, вектор R_n / R_B0
+    по стробам (range_scale_axis); возвращает SearchResult с phi^(0):
+    вектор длины M без дальности или массив (M, N) с ней.
 
-    Сначала грубая сетка по двум первым степеням (GRID_HALF_STEPS), потом
-    покоординатное уточнение (rounds кругов, шаг делится пополам).
+    Три ступени:
+      1. широкий скан одной квадратичной, +-prescan_half с шагом
+         prescan_step, по каждому PRESCAN_RANGE_STRIDE-му стробу — чтобы
+         достать ошибку скорости в сотни радиан;
+      2. грубая сетка по двум первым степеням вокруг найденного
+         (GRID_HALF_STEPS шагов step_initial);
+      3. покоординатное уточнение, rounds кругов, шаг делится пополам.
 
-    Стоимость: одно БПФ сцены на оценку; сетка 81 плюс уточнение около 50
-    — примерно 130 БПФ сцены. У этапа C на 22 блоках по 200 итераций их
-    8800.
+    Стоимость: одно БПФ сцены на оценку; скан 81 (на четверти стробов),
+    сетка 81, уточнение около 50. У этапа C на 22 блоках по 200 итераций
+    БПФ 8800.
     """
     h_device = backend.asarray(h)
     M, N = h_device.shape
@@ -240,21 +299,50 @@ def search(backend: Backend, h, degrees=DEGREES, step_initial: float = STEP_INIT
 
     def evaluate(coefficients: dict[int, float]) -> float:
         counter["n"] += 1
-        return scene_entropy(backend, h_device, polynomial_phase(u, coefficients),
+        return scene_entropy(backend, h_device,
+                             polynomial_phase(u, coefficients, range_scale),
                              S_g, floor)
+
+    # прореженная по дальности сцена для широкого скана: свои S_g и порог
+    stride = PRESCAN_RANGE_STRIDE
+    h_thin = backend.asarray(h_device[:, ::stride])
+    scale_thin = None if range_scale is None else range_scale[::stride]
+    S_g_thin = C.total_energy(backend, backend.xp.abs(h_thin) ** 2, M)
+    floor_thin = C.power_floor(S_g_thin, M, h_thin.shape[1], floor_relative)
+
+    def evaluate_thin(coefficients: dict[int, float]) -> float:
+        counter["n"] += 1
+        return scene_entropy(backend, h_thin,
+                             polynomial_phase(u, coefficients, scale_thin),
+                             S_g_thin, floor_thin)
 
     coefficients = {d: 0.0 for d in degrees}
     S_start = evaluate(coefficients)
     history = []
 
-    # грубая сетка по ПЕРВЫМ ДВУМ степеням (остальные в нуле): ищет ложбину,
-    # в которой потом уточняться, а не ближайшую к нулю
+    # ступень 1: широкий скан квадратичной. Минимум ищется на прореженной
+    # сцене; берётся только положение, энтропия потом пересчитывается на всей
+    d_a = degrees[0]
+    if prescan_half > 0.0:
+        best_thin, best_c = None, 0.0
+        n_steps = int(round(prescan_half / prescan_step))
+        for k in range(-n_steps, n_steps + 1):
+            coefficients[d_a] = k * prescan_step
+            S_thin = evaluate_thin(coefficients)
+            if best_thin is None or S_thin < best_thin:
+                best_thin, best_c = S_thin, coefficients[d_a]
+        coefficients[d_a] = best_c
+        history.append((-1, d_a, best_c, float(best_thin)))
+
+    # ступень 2: грубая сетка по ПЕРВЫМ ДВУМ степеням вокруг найденного
+    # (остальные в нуле): ищет ложбину, в которой потом уточняться
     grid = [k * step_initial for k in range(-GRID_HALF_STEPS, GRID_HALF_STEPS + 1)]
-    S_now, best = S_start, dict(coefficients)
-    d_a, d_b = degrees[0], degrees[1] if len(degrees) > 1 else degrees[0]
+    centre_a = coefficients[d_a]
+    S_now, best = evaluate(coefficients), dict(coefficients)
+    d_b = degrees[1] if len(degrees) > 1 else degrees[0]
     for c_a in grid:
         for c_b in (grid if d_b != d_a else [0.0]):
-            coefficients[d_a], coefficients[d_b] = c_a, c_b
+            coefficients[d_a], coefficients[d_b] = centre_a + c_a, c_b
             S_here = evaluate(coefficients)
             if S_here < S_now:
                 S_now, best = S_here, dict(coefficients)
@@ -262,7 +350,7 @@ def search(backend: Backend, h, degrees=DEGREES, step_initial: float = STEP_INIT
     history.append((0, d_a, coefficients[d_a], S_now))
     history.append((0, d_b, coefficients[d_b], S_now))
 
-    # уточнение: покоординатный спуск с убывающим шагом, от шага сетки
+    # ступень 3: покоординатный спуск с убывающим шагом, от шага сетки
     step = step_initial
     for round_index in range(rounds):
         for degree in degrees:
@@ -271,7 +359,7 @@ def search(backend: Backend, h, degrees=DEGREES, step_initial: float = STEP_INIT
         step /= 2.0
 
     return SearchResult(
-        phi=polynomial_phase(u, coefficients),
+        phi=polynomial_phase(u, coefficients, range_scale),
         coefficients=dict(coefficients),
         entropy_start=S_start,
         entropy_final=S_now,
