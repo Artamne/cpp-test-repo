@@ -62,6 +62,10 @@ from stage_a_blocks import Geometry
 from validate import image_sharpness, phase_residual_rms, truth_on_block_grid
 
 
+#: Процентили для границ показа. Не нормировка по максимуму: см.
+#: display_window, там замер, почему максимум даёт чёрную картинку.
+DISPLAY_LOW, DISPLAY_HIGH = 5.0, 97.0
+
 #: Контраст однородного полностью развитого спекла. Не подгонка, а точное
 #: значение: у комплексно-гауссова поля интенсивность распределена
 #: экспоненциально, <I^2> = 2<I>^2, значит sqrt(<I^2>)/<I> = sqrt(2). Ниже
@@ -314,6 +318,32 @@ def grid_agreement(meta: dict, m_p: float, n_p: float,
     return lines
 
 
+def display_window(amplitude: np.ndarray, low: float = DISPLAY_LOW,
+                   high: float = DISPLAY_HIGH) -> tuple[float, float]:
+    """Границы показа картинки в дБ — ПО ПРОЦЕНТИЛЯМ, а не по максимуму.
+
+    Повторяет prepare_slice_rda.display_window намеренно: тот скрипт
+    держится самостоятельным, его уносят на машину с данными одним
+    файлом, и импорта отсюда там быть не должно.
+
+    Принимает модуль изображения и две процентили; возвращает (vmin, vmax)
+    в дБ для imshow.
+
+    Нормировка по максимуму для радиолокационной сцены не годится, и это не
+    вкус, а арифметика. Несколько ярких отражателей сидят на 40-50 дБ выше
+    местности, поэтому при делении на максимум медиана картинки оказывается
+    около -33 дБ, а окно -40…0 оставляет половину пикселей в самом низу:
+    изображение выходит чёрным. Замер на срезе владельца:
+
+        P25 -37,3 дБ   P50 -33,2 дБ   P75 -29,4 дБ   P99 -2,7 дБ
+
+    Окно P5…P97 шириной 32 дБ кладёт медиану на 37 % серой шкалы, оставляя
+    5 % чёрных и 3 % белых — так и показывают РСА.
+    """
+    db = 20.0 * np.log10(np.maximum(amplitude, amplitude.max() * 1e-6))
+    return float(np.percentile(db, low)), float(np.percentile(db, high))
+
+
 def probe_phase(backend, h: np.ndarray, edge_rad: float) -> tuple[np.ndarray, float]:
     """Известная квадратичная ошибка для пробы; живёт ТОЛЬКО в занятой полосе.
 
@@ -469,14 +499,19 @@ def main() -> int:
         import matplotlib.pyplot as plt
 
         fig, axes = plt.subplots(1, 2, figsize=(13, 6.5))
-        top = float(np.abs(after).max())
+        # окно показа считается по картинке ДО и применяется к обеим: разные
+        # шкалы сделали бы сравнение ложным
+        vmin, vmax = display_window(np.abs(before))
+        floor = float(np.abs(before).max()) * 1e-6
         for ax, image, title in ((axes[0], before, "до"), (axes[1], after, "после")):
-            db = 20 * np.log10(np.maximum(np.abs(image), top * 1e-3) / top)
-            ax.imshow(db, aspect="auto", cmap="gray", vmin=-45, vmax=0)
+            db = 20 * np.log10(np.maximum(np.abs(image), floor))
+            ax.imshow(db, aspect="auto", cmap="gray", vmin=vmin, vmax=vmax)
             ax.set_title(f"{title}, контраст {contrast(image):.2f}")
             ax.set_xlabel("строб дальности n")
             ax.set_ylabel("азимут m")
-        fig.suptitle(f"MN-MEA на реальной записи, сетка {run['M_k']}x{run['N_k']}")
+        fig.suptitle(f"MN-MEA на реальной записи, сетка {run['M_k']}x{run['N_k']}"
+                     f"; показ {vmin:.0f} … {vmax:.0f} дБ, окно "
+                     f"P{DISPLAY_LOW:g}-P{DISPLAY_HIGH:g}, общее для обеих")
         fig.tight_layout()
         out = directory / "mn_mea_do_posle.png"
         fig.savefig(out, dpi=120)

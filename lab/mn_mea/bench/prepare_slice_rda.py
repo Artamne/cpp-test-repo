@@ -96,6 +96,10 @@ SURVEY_STEP = 64
 #: подмена: просто предупреждение, что срез встал не туда, где сцена.
 ENERGY_WARN_RATIO = 3.0
 
+#: Процентили для границ показа. Не нормировка по максимуму: см.
+#: display_window, там замер, почему максимум даёт чёрную картинку.
+DISPLAY_LOW, DISPLAY_HIGH = 5.0, 97.0
+
 C_LIGHT = 299_792_458.0
 OUT_NAME = "mn_mea_srez"
 
@@ -281,6 +285,28 @@ def range_axis_metres(passport: dict, check: dict, ka_dir: str) -> np.ndarray:
                            ["by_range_table.rows"]))
     r0 = float(table[0]["r_lo_m"])
     return r0 + r_b * np.arange(passport["shape"][0], dtype=np.float64)
+
+
+def display_window(amplitude: np.ndarray, low: float = DISPLAY_LOW,
+                   high: float = DISPLAY_HIGH) -> tuple[float, float]:
+    """Границы показа картинки в дБ — ПО ПРОЦЕНТИЛЯМ, а не по максимуму.
+
+    Принимает модуль изображения и две процентили; возвращает (vmin, vmax)
+    в дБ для imshow.
+
+    Нормировка по максимуму для радиолокационной сцены не годится, и это не
+    вкус, а арифметика. Несколько ярких отражателей сидят на 40-50 дБ выше
+    местности, поэтому при делении на максимум медиана картинки оказывается
+    около -33 дБ, а окно -40…0 оставляет половину пикселей в самом низу:
+    изображение выходит чёрным. Замер на срезе владельца:
+
+        P25 -37,3 дБ   P50 -33,2 дБ   P75 -29,4 дБ   P99 -2,7 дБ
+
+    Окно P5…P97 шириной 32 дБ кладёт медиану на 37 % серой шкалы, оставляя
+    5 % чёрных и 3 % белых — так и показывают РСА.
+    """
+    db = 20.0 * np.log10(np.maximum(amplitude, amplitude.max() * 1e-6))
+    return float(np.percentile(db, low)), float(np.percentile(db, high))
 
 
 def parse_window(words: list[str], n_r: int, n_az: int,
@@ -715,9 +741,10 @@ def main() -> None:
         import matplotlib.pyplot as plt
 
         A = np.abs(g)
-        dB = 20 * np.log10(np.maximum(A, A.max() * 1e-5) / A.max())
+        vmin, vmax = display_window(A)
+        dB = 20 * np.log10(np.maximum(A, A.max() * 1e-6))
         plt.figure(figsize=(10, 7))
-        plt.imshow(dB, aspect="auto", cmap="gray", vmin=-40, vmax=0)
+        plt.imshow(dB, aspect="auto", cmap="gray", vmin=vmin, vmax=vmax)
         plt.colorbar(label="дБ")
         plt.xlabel("дальность, отсчёты")
         plt.ylabel("азимут, отсчёты")
