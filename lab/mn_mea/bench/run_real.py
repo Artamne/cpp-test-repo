@@ -384,17 +384,26 @@ def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
     h_device = backend.asarray(h)
     scene = A.scene_image(backend, h_device)
 
-    # этап B без ИНС: одна начальная фаза на сцену, на сетке сцены
-    initial = BS.search(backend, h_device) if start == "polinom" else None
+    # этап B без ИНС: одна начальная фаза на сцену, с зависимостью от
+    # дальности (stage_b_search.RANGE_POWER_OFFSET). Она ПРИМЕНЯЕТСЯ К
+    # ДАННЫМ до нарезки, и этап C идёт по книге из нуля на исправленной
+    # сцене. Это то же самое, что стартовать этап C из phi^(0), пока phi^(0)
+    # зависит только от бина; с дальностью иначе нельзя — у этапа C фаза
+    # одна на все стробы блока. Итог для блока: phi^(0)(k, n) + phi_C(k).
+    initial = None
+    scene_corrected = scene
+    if start == "polinom":
+        range_scale = BS.range_scale_axis(geom.R_B0, geom.r_b, N)
+        initial = BS.search(backend, h_device, range_scale=range_scale)
+        h_corrected = h_device * backend.xp.exp(1j * backend.asarray(initial.phi))
+        scene_corrected = A.scene_image(backend, h_corrected)
 
     # первый проход: каждый блок ищет свою фазу
     rows = []
     for block in blocks:
-        data = A.block_data(backend, scene, block)
+        data = A.block_data(backend, scene_corrected, block)
         L = data.h.shape[0]
-        phi_0 = (truth_on_block_grid(initial.phi, L) if initial is not None
-                 else np.zeros(L))
-        result = C.iterate_block(backend, data.h, phi_0, mu=mu,
+        result = C.iterate_block(backend, data.h, np.zeros(L), mu=mu,
                                  max_iterations=max_iterations,
                                  core=(data.core_start, data.core_stop),
                                  target_fraction=target_fraction)
@@ -419,7 +428,7 @@ def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
     # держать в памяти двадцать пять блоков ради возможного переноса фазы
     after, before = {}, {}
     for block, row in zip(blocks, rows):
-        data = A.block_data(backend, scene, block)
+        data = A.block_data(backend, scene_corrected, block)
         L = data.h.shape[0]
         phi = (truth_on_block_grid(donor["phi"], L) if donor is not None
                else row["phi"])
@@ -428,8 +437,11 @@ def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
         shown = D.azimuth_window(backend, data.h)
         after[block.q_k] = D.block_image(backend, shown, phi)[
             data.core_start : data.core_stop]
-        before[block.q_k] = D.block_image(backend, shown, np.zeros(L))[
-            data.core_start : data.core_stop]
+        # «до» — с ИСХОДНОЙ сцены, без поправки этапа B
+        raw = A.block_data(backend, scene, block)
+        before[block.q_k] = D.block_image(
+            backend, D.azimuth_window(backend, raw.h), np.zeros(L))[
+            raw.core_start : raw.core_stop]
 
     return {
         "blocks": blocks, "M_k": M_k, "N_k": N_k, "per_block": rows,
@@ -651,8 +663,20 @@ def main() -> int:
               f"({ini.entropy_final - ini.entropy_start:+.4f}), "
               f"{ini.n_evaluations} оценок; коэффициенты при Лежандре "
               + ", ".join(f"P{d} = {c:+.2f}" for d, c in ini.coefficients.items())
-              + f" рад; размах phi^(0) в полосе "
+              + f" рад (при R = R_B0); размах phi^(0) в полосе "
               f"{ini.phi.max() - ini.phi.min():.1f} рад")
+        # квадратичная на краю полосы -> ошибка скорости продукта. Полная
+        # фаза апертуры Phi = pi K_a (T_a/2)^2, K_a = 2 v^2 / (lambda R);
+        # остаток a = Phi * dK/K = 2 Phi * dv/v, значит dv = a v / (2 Phi).
+        # Край полосы взят за край апертуры — на этой записи 93 против
+        # 72 Гц, оценка грубая, в полтора раза
+        a_quadratic = 1.5 * ini.coefficients.get(2, 0.0)   # P2 = 1,5 u^2 - 0,5
+        phi_aperture = (math.pi * geom.v_x0 ** 2 * geom.T_a ** 2
+                        / (2.0 * geom.lambda_ * geom.R_B0))
+        dv = a_quadratic * geom.v_x0 / (2.0 * phi_aperture)
+        print(f"  квадратичная {a_quadratic:+.1f} рад на краю полосы при полной фазе "
+              f"апертуры {phi_aperture:.0f} рад — это ошибка скорости продукта "
+              f"около {dv:+.2f} м/с (грубо, в полтора раза)")
     else:
         print("начальная фаза нулевая (start=nol), этап B не делается")
     if run["donor"] is not None:
