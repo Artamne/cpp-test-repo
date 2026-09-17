@@ -22,6 +22,7 @@
 
     find_targets        найти яркие одиночные цели
     azimuth_cut         вырезать КОМПЛЕКСНЫЙ срез по азимуту вокруг цели
+    range_cut           то же по ДАЛЬНОСТИ — чтобы отличить размаз от объекта
     upsample            уплотнить срез (validate.interpolated_cut) и взять модуль
     width_at            ширина на заданном уровне, в элементах разрешения
     islr                доля энергии вне главного лепестка
@@ -106,6 +107,27 @@ def azimuth_cut(image: np.ndarray, m: int, n: int, window: int) -> np.ndarray:
     return np.asarray(image)[m - window : m + window, n]
 
 
+def range_cut(image: np.ndarray, m: int, n: int, window: int) -> np.ndarray:
+    """КОМПЛЕКСНЫЙ срез по ДАЛЬНОСТИ вокруг цели.
+
+    Принимает картинку, координаты цели и полуширину окна; возвращает срез.
+
+    Зачем он нужен. Автофокус правит фазу ТОЛЬКО по азимуту, по дальности
+    он не трогает ничего. Значит если цель широка и по дальности тоже —
+    это не расфокусировка, а либо протяжённый объект (угол здания, техника,
+    кромка берега), либо остаточная миграция дальности, и азимутальным
+    автофокусом её не лечат.
+
+    Окно берётся то же, что по азимуту, но в стробах: сколько стробов
+    занимает элемент разрешения по дальности, скрипту неизвестно — r_b в
+    Geometry одно число, — поэтому ширина возвращается в ОТСЧЁТАХ, а не в
+    элементах разрешения.
+    """
+    row = np.asarray(image)[m, :]
+    lo, hi = max(n - window, 0), min(n + window, row.size)
+    return row[lo:hi]
+
+
 def upsample(cut: np.ndarray, factor: int = OVERSAMPLE) -> np.ndarray:
     """Уплотнить срез и вернуть модуль.
 
@@ -169,8 +191,10 @@ def islr(profile: np.ndarray, cells: float, factor: int = OVERSAMPLE) -> float:
 def measure_target(image: np.ndarray, m: int, n: int, cells: float,
                    window: int) -> dict:
     """Все числа по одной цели."""
-    cut = azimuth_cut(image, m, n, window)
-    profile = upsample(cut)
+    profile = upsample(azimuth_cut(image, m, n, window))
+    # по дальности окно берём вчетверо уже: там цель занимает единицы
+    # стробов, и тянуть хвост на сотню незачем
+    across = upsample(range_cut(image, m, n, max(window // 4, 8)))
     peak = float(profile.max())
     return {
         "m": m, "n": n,
@@ -179,6 +203,10 @@ def measure_target(image: np.ndarray, m: int, n: int, cells: float,
         "width_10db": width_at(profile, -10.0, cells),
         "width_20db": width_at(profile, -20.0, cells),
         "islr_db": islr(profile, cells),
+        # по дальности — в ОТСЧЁТАХ: сколько стробов в элементе разрешения,
+        # отсюда не видно (см. range_cut)
+        "range_3db": width_at(across, -3.0, 1.0),
+        "range_20db": width_at(across, -20.0, 1.0),
         "profile": profile,
     }
 
