@@ -1,11 +1,22 @@
 """Прогон MN-MEA на срезе РЕАЛЬНОЙ записи, подготовленном prepare_slice.py.
 
     python3 bench/run_real.py путь/к/mn_mea_srez [M_k x N_k] [mu] [проба]
+    python3 bench/run_real.py путь/к/mn_mea_srez 25x1 iter=200 faza=luchshaya
 
 Читает h_srez.npy и meta.json, проверяет вход, считает, кладёт рядом
 картинки до и после и числа. Сетку блоков можно задать вторым аргументом,
 например 8x1; без него берётся (5-20) по геометрии из паспорта. Третьим —
 порог останова (5-9), по умолчанию MU_REAL.
+
+ИМЕНОВАННЫЕ АРГУМЕНТЫ, их можно мешать с позиционными в любом порядке:
+
+    setka=25x1      сетка блоков, то же что первым позиционным
+    mu=0.03         порог останова (5-9)
+    proba=0.8       размах пробы в радианах, см. ниже
+    iter=200        предел числа итераций вместо книжных 40
+    faza=luchshaya  ОДНА фаза на всю сцену, взятая у блока, где энтропия
+                    упала сильнее всех. По умолчанию faza=svoya — каждый
+                    блок со своей, как в книге
 
 ЧЕТВЁРТЫЙ АРГУМЕНТ — ПРОБА, и он отвечает на вопрос, который иначе не
 решается. Если прогон почти ничего не меняет, причин ровно две: остаточной
@@ -46,6 +57,7 @@ from __future__ import annotations
 import json
 import math
 import pathlib
+import re
 import sys
 
 _sys_path = pathlib.Path(__file__).resolve().parent.parent / "algorithm"
@@ -135,6 +147,55 @@ BAND_GAMMA_TOLERANCE = 0.15
 MU_REAL = 0.03
 
 
+def parse_options(words: list[str]) -> tuple:
+    """Разобрать аргументы после пути.
+
+    Принимает слова; возвращает (сетка, mu, проба, предел итераций, общая ли
+    фаза).
+
+    Позиционные и именованные мешаются свободно, и правило простое: слово с
+    '=' — именованное; слово вида ЧИСЛОxЧИСЛО — сетка; голое число — сперва
+    mu, потом проба. Позиционный вид оставлен потому, что им уже пользуются;
+    именованный добавлен потому, что настроек стало пять и на память их
+    порядок уже не ложится.
+    """
+    grid, mu, probe = None, MU_REAL, 0.0
+    iterations, shared = C.MAX_ITERATIONS, False
+    bare = 0
+    for word in words:
+        if "=" in word:
+            name, _, value = word.partition("=")
+            if name == "setka":
+                a, b = value.lower().split("x")
+                grid = (int(a), int(b))
+            elif name == "mu":
+                mu = float(value)
+            elif name == "proba":
+                probe = float(value)
+            elif name == "iter":
+                iterations = int(value)
+            elif name == "faza":
+                if value not in ("svoya", "luchshaya"):
+                    sys.exit(f"faza={value}: есть svoya и luchshaya")
+                shared = value == "luchshaya"
+            else:
+                sys.exit(f"неизвестный аргумент {name!r}; есть setka, mu, "
+                         "proba, iter, faza")
+        elif re.fullmatch(r"\d+[xX]\d+", word):
+            a, b = word.lower().split("x")
+            grid = (int(a), int(b))
+        else:
+            value = float(word)
+            if bare == 0:
+                mu = value
+            elif bare == 1:
+                probe = value
+            else:
+                sys.exit(f"лишнее число {word!r}: голыми идут только mu и проба")
+            bare += 1
+    return grid, mu, probe, iterations, shared
+
+
 def read_slice(directory: pathlib.Path) -> tuple[np.ndarray, dict]:
     """Прочитать срез и паспорт.
 
@@ -168,16 +229,57 @@ def geometry_from_meta(meta: dict) -> Geometry:
                     lambda_=float(meta["geometry"]["lambda_"]))
 
 
+def best_block(rows: list[dict]) -> dict | None:
+    """Блок, у которого энтропия упала сильнее всех.
+
+    Принимает список строк по блокам; возвращает строку-победителя или None.
+
+    Падение энтропии — прямая мера того, СКОЛЬКО сведений о фазе было у
+    блока: критерий (5-6) ровно её и минимизирует, и насколько он смог её
+    опустить, настолько ему и было за что зацепиться.
+
+    Брать блок с наименьшей ИТОГОВОЙ энтропией нельзя, хотя соблазн есть.
+    Низкая энтропия бывает и у блока, наполовину занятого водой: энергия
+    распределена неравномерно, а сведений о фазе там ноль. Замер на записи
+    владельца: у блока с постройками падение 0,1262, у остальных
+    двадцати четырёх не больше 0,0069 — разница в двадцать раз, и спутать
+    её не с чем.
+    """
+    if not rows:
+        return None
+    return max(rows, key=lambda r: r["entropy_before"] - r["entropy_after"])
+
+
 def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
-          mu: float = MU_REAL) -> dict:
+          mu: float = MU_REAL, max_iterations: int = C.MAX_ITERATIONS,
+          shared_phase: bool = False) -> dict:
     """Собственно прогон: блоки, этап C из нуля, этап D.
 
-    Принимает h, Geometry, сетку блоков (или None — тогда по (5-20)) и порог
-    останова; возвращает словарь с картинками и числами по блокам.
+    Принимает h, Geometry, сетку блоков (или None — тогда по (5-20)), порог
+    останова, предел итераций и признак общей фазы; возвращает словарь с
+    картинками и числами по блокам.
 
     Начальная фаза НУЛЕВАЯ, этап B не делается. Замер на стенде показал, что
     книжная (5-30) не помогает, а мешает: член -(q-q_k)/2 из (5-29) уводит
     eta в диапазон около [-6, +0,6]. См. README, «Если ИНС нет».
+
+    ОБЩАЯ ФАЗА (shared_phase) — не из книги, и вот зачем она. Сведения о
+    фазе несут только яркие точечные отражатели: замер показал, что крупные
+    однородные области (вода, поле, лес) опускают энтропию, но градиента по
+    фазе почти не дают — при 1,5 рад прирост +0,0059 против +0,0204 у той
+    же сцены с целями. На записи владельца цели собрались в одном блоке из
+    двадцати пяти, и остальные двадцать четыре возвращали ноль — правильно
+    возвращали, у них этих сведений нет.
+
+    Но носитель-то один и полёт один: ошибка движения у блоков общая, если
+    сцена не слишком велика. Поэтому здесь фаза лучшего блока переносится
+    на все остальные. Это ПРОТИВОРЕЧИТ духу (5-20), где блоки заведены как
+    раз ради пространственной изменчивости, и потому включается явно, а не
+    по умолчанию: проверять, стало ли лучше, надо линейкой (bench/smear.py),
+    а не верой.
+
+    Перенос идёт через truth_on_block_grid: у блоков разной длины
+    доплеровская сетка разная, и резать чужую фазу отрезком нельзя.
     """
     backend = get_backend("auto")
     M, N = h.shape
@@ -192,18 +294,15 @@ def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
 
     h_device = backend.asarray(h)
     scene = A.scene_image(backend, h_device)
-    after, before, rows = {}, {}, []
+
+    # первый проход: каждый блок ищет свою фазу
+    rows = []
     for block in blocks:
         data = A.block_data(backend, scene, block)
         L = data.h.shape[0]
         result = C.iterate_block(backend, data.h, np.zeros(L), mu=mu,
+                                 max_iterations=max_iterations,
                                  core=(data.core_start, data.core_stop))
-        phi = D.remove_image_shift(backend, result.phi)
-        shown = D.azimuth_window(backend, data.h)
-        after[block.q_k] = D.block_image(backend, shown, phi)[
-            data.core_start : data.core_stop]
-        before[block.q_k] = D.block_image(backend, shown, np.zeros(L))[
-            data.core_start : data.core_stop]
         rows.append({
             "q_k": block.q_k,
             "shape": block.shape,
@@ -216,9 +315,29 @@ def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
             "block_bins": L,
             "phi": result.phi,
         })
+
+    donor = best_block(rows) if shared_phase else None
+
+    # второй проход: картинки. Блок режется заново — это срез плюс одно
+    # ОПФ, против сорока итераций стоимость незаметна, зато не приходится
+    # держать в памяти двадцать пять блоков ради возможного переноса фазы
+    after, before = {}, {}
+    for block, row in zip(blocks, rows):
+        data = A.block_data(backend, scene, block)
+        L = data.h.shape[0]
+        phi = (truth_on_block_grid(donor["phi"], L) if donor is not None
+               else row["phi"])
+        row["phi_used"] = phi
+        phi = D.remove_image_shift(backend, phi)
+        shown = D.azimuth_window(backend, data.h)
+        after[block.q_k] = D.block_image(backend, shown, phi)[
+            data.core_start : data.core_stop]
+        before[block.q_k] = D.block_image(backend, shown, np.zeros(L))[
+            data.core_start : data.core_stop]
+
     return {
         "blocks": blocks, "M_k": M_k, "N_k": N_k, "per_block": rows,
-        "m_p": m_p, "n_p": n_p,
+        "m_p": m_p, "n_p": n_p, "donor": donor,
         "image_before": backend.to_numpy(D.assemble(backend, before, blocks, M, N)),
         "image_after": backend.to_numpy(D.assemble(backend, after, blocks, M, N)),
         "backend": backend,
@@ -399,12 +518,7 @@ def main() -> int:
         print(__doc__)
         return 2
     directory = pathlib.Path(sys.argv[1])
-    grid = None
-    if len(sys.argv) > 2:
-        a, b = sys.argv[2].lower().split("x")
-        grid = (int(a), int(b))
-    mu = float(sys.argv[3]) if len(sys.argv) > 3 else MU_REAL
-    probe = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
+    grid, mu, probe, iterations, shared = parse_options(sys.argv[2:])
 
     h, meta = read_slice(directory)
     geom = geometry_from_meta(meta)
@@ -428,9 +542,21 @@ def main() -> int:
                                meta.get("gamma_win")):
         print(line)
 
-    run = focus(h, geom, grid, mu=mu)
+    run = focus(h, geom, grid, mu=mu, max_iterations=iterations,
+                shared_phase=shared)
     print(f"\nсетка блоков {run['M_k']}x{run['N_k']}, порог (5-9) mu = {mu:g}, "
-          f"начальная фаза нулевая (этап B не делается)")
+          f"предел {iterations} итераций, начальная фаза нулевая "
+          f"(этап B не делается)")
+    if run["donor"] is not None:
+        d = run["donor"]
+        drops = sorted(r["entropy_before"] - r["entropy_after"]
+                       for r in run["per_block"])
+        print(f"ОБЩАЯ ФАЗА: взята у блока {d['q_k']}, у него энтропия упала на "
+              f"{d['entropy_before'] - d['entropy_after']:.4f}; "
+              f"у следующего за ним — на {drops[-2] if len(drops) > 1 else 0:.4f}")
+        print("Это НЕ по книге: (5-20) заводит блоки как раз ради "
+              "пространственной изменчивости. Смотрите линейку — стало ли "
+              "лучше там, где своей фазы не было.")
     for line in grid_agreement(meta, run["m_p"], run["n_p"],
                                None if grid else run["N_k"]):
         print(line)
@@ -469,7 +595,8 @@ def main() -> int:
               f"краю занятой полосы, СКО {np.std(phi_probe):.3f} рад. "
               "Второй прогон, сверяется разность оценок.")
         spoiled = h * np.exp(-1j * phi_probe)[:, None].astype(h.dtype)
-        run_probe = focus(spoiled, geom, grid, mu=mu)
+        run_probe = focus(spoiled, geom, grid, mu=mu,
+                          max_iterations=iterations, shared_phase=shared)
 
         print(f"\n{'блок':>5}{'внесено, рад':>14}{'осталось, рад':>15}"
               f"{'снято':>8}")
