@@ -477,6 +477,10 @@ def build_meta(rda_path: str, passport: dict, check: dict, vel: dict,
         },
         "prf": prf,
         "m_aperture": cut["M_aperture"],
+        # расширение главного лепестка весовым окном: входит и в длину
+        # апертуры, и в связь занятости полосы с разрешением (см. run_real)
+        "gamma_win": gamma,
+        "gamma_istochnik": gamma_src,
         # два разных числа, сведённые в коде MN-MEA в одно r_a: шаг идёт в
         # (5-22), разрешение — в (5-20). На этой записи они расходятся в разы
         "r_a_shag": v / prf,
