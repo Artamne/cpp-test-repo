@@ -439,6 +439,13 @@ SEGMENT_SEARCH_PAD_FRACTION = 0.0
 #: поправки нет по построению, а поиск на обрезанной полосе вернул бы шум.
 SEGMENT_BAND_MIN_FRACTION = 0.6
 
+#: Что делать с поправкой ТАМ, где её нельзя измерить (полоса урезана):
+#: 'hold' — держать последнее надёжное значение, 'zero' — сводить к нулю.
+#: Физически ошибка опорной функции у края кадра никуда не девается —
+#: теряется лишь возможность её измерить, — поэтому по умолчанию 'hold'.
+#: Выбор замерен на крае кадра владельца, см. coefficients_at.
+SEGMENT_EDGE_POLICY = "hold"
+
 #: Широкий скан по сегменту: полуширина и шаг для квадратичной и для
 #: кубической. Край кадра владельца — до 930 рад квадратичной.
 SEGMENT_PRESCAN_HALF_RAD = 1200.0
@@ -556,26 +563,35 @@ TILE_ROWS = 128
 APPLY_WINDOW_ROWS = 4096
 
 
-def coefficients_at(segments: list[SegmentResult], m: float) -> dict[int, float]:
+def coefficients_at(segments: list[SegmentResult], m: float,
+                    edge_policy: str = SEGMENT_EDGE_POLICY) -> dict[int, float]:
     """Коэффициенты поправки в строке m — линейная интерполяция по центрам сегментов.
 
     Принимает список поправок сегментов и строку; возвращает словарь
-    степень -> коэффициент. За крайними центрами — постоянно. Сегменты с
-    урезанной полосой несут нули и участвуют как нули: поправка к краю
-    кадра плавно сходит на нет, а не обрывается.
+    степень -> коэффициент. За крайними центрами — постоянно.
+
+    Сегменты, где поиск не делался (полоса урезана, n_evaluations = 0),
+    при edge_policy 'hold' в интерполяцию не входят: поправка за последним
+    измеренным центром держится постоянной. При 'zero' они участвуют
+    нулями, и поправка сходит к нулю за полсегмента.
     """
-    centres = np.array([(s.row_start + s.row_stop) / 2.0 for s in segments])
+    if edge_policy == "hold":
+        used = [s for s in segments if s.n_evaluations > 0] or segments
+    else:
+        used = segments
+    centres = np.array([(s.row_start + s.row_stop) / 2.0 for s in used])
     order = np.argsort(centres)
-    degrees = sorted({d for s in segments for d in s.coefficients})
+    degrees = sorted({d for s in used for d in s.coefficients})
     return {d: float(np.interp(m, centres[order],
-                               np.array([segments[i].coefficients.get(d, 0.0) for i in order])))
+                               np.array([used[i].coefficients.get(d, 0.0) for i in order])))
             for d in degrees}
 
 
 def apply_segments(backend: Backend, h, segments: list[SegmentResult],
                    range_scale: np.ndarray | None = None,
                    floor_factor: float = C.SIGNAL_FLOOR_FACTOR,
-                   tile_rows: int = TILE_ROWS, window_rows: int = APPLY_WINDOW_ROWS):
+                   tile_rows: int = TILE_ROWS, window_rows: int = APPLY_WINDOW_ROWS,
+                   edge_policy: str = SEGMENT_EDGE_POLICY):
     """Исправленная сцена: перекрытие с сохранением, одна поправка на плитку.
 
     Принимает бэкенд, данные сцены и список поправок; возвращает
@@ -603,7 +619,7 @@ def apply_segments(backend: Backend, h, segments: list[SegmentResult],
     out = xp.zeros_like(g_scene)
     for t0 in range(0, M, tile_rows):
         t1 = min(t0 + tile_rows, M)
-        coefficients = coefficients_at(segments, (t0 + t1) / 2.0)
+        coefficients = coefficients_at(segments, (t0 + t1) / 2.0, edge_policy)
         if all(abs(c) < 1e-9 for c in coefficients.values()):
             out[t0:t1] = g_scene[t0:t1]
             continue
@@ -627,7 +643,7 @@ def apply_segments(backend: Backend, h, segments: list[SegmentResult],
 #: проход идёт по уже исправленной сцене, где остаток в разы меньше и
 #: внутри сегмента почти постоянен. Третий проход на том же замере
 #: ничего не добавлял.
-SEGMENT_PASSES = 2
+SEGMENT_PASSES = 3
 
 #: ПЕРВЫЙ ПРОХОД — ТОЛЬКО КВАДРАТИЧНАЯ. Замер на крае кадра владельца,
 #: скан по окнам с центрами 1024 / 1536 / 2048 строк:
