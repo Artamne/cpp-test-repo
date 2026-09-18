@@ -681,29 +681,38 @@ def apply_segments(backend: Backend, h, segments: list[SegmentResult],
             continue
         w0 = max(0, min((t0 + t1) // 2 - window_rows // 2, M - window_rows))
         w1 = min(M, w0 + window_rows)
-        h_seg, pad = segment_data(backend, g_scene, w0, w1)
-        L = h_seg.shape[0]
+        rows = w1 - w0
+        pad = int(round(SEGMENT_PAD_FRACTION * rows))
+        L = rows + 2 * pad
         f_seg = np.fft.fftfreq(L)
         u_seg = np.where(np.abs(f_seg) <= edge, f_seg / edge, 0.0)
-        # фаза (L, N): коэффициент каждой степени линейно интерполируется по
-        # дальности между центрами полос, за крайними — постоянен
-        # фаза (L, N) в одинарной точности: окно 8192 x 5660 в двойной
-        # вместе с экспонентой и произведением занимало ~3 ГБ на плитку, и
-        # прогон края кадра убивался по памяти (cgroup 8 ГБ). Точности
-        # float32 для фазы в сотни радиан хватает: шаг 3e-5 рад
-        phi = np.zeros((L, N), dtype=np.float32)
-        for degree in sorted({d for c in per_strip for d in c}):
-            values = np.array([c.get(degree, 0.0) for c in per_strip])
-            if not np.any(values):
-                continue
-            along_range = (np.interp(n_axis, strip_centres, values)
-                           if len(strips) > 1 else np.full(N, values[0]))
-            phi += (legendre(u_seg, degree)[:, None] * along_range[None, :]).astype(np.float32)
-        phi[u_seg == 0.0, :] = 0.0
-        factor = xp.exp(1j * backend.asarray(phi)).astype(h_seg.dtype)
-        g_win = backend.fft_kernel_minus(h_seg * factor)
-        del factor
-        out[t0:t1] = g_win[pad + (t0 - w0) : pad + (t1 - w0)]
+        # По дальности — кусками по RANGE_STRIP_GATES: окно 8192 x 5660
+        # целиком с экспонентой, произведением и БПФ в двойной точности
+        # занимало ~3 ГБ на плитку, и прогон края кадра убивался по памяти
+        # (cgroup 8 ГБ). Кусок в 1000 стробов — в шесть раз меньше. Фаза в
+        # одинарной точности: для сотен радиан шаг 3e-5 рад. Коэффициент
+        # каждой степени линейно интерполируется по дальности между
+        # центрами полос, за крайними — постоянен
+        for (a, b) in range_strips(N):
+            buffer = xp.zeros((L, b - a), dtype=g_scene.dtype)
+            buffer[pad : pad + rows] = g_scene[w0:w1, a:b]
+            h_win = xp.fft.ifft(buffer, axis=0) / backend.alpha
+            del buffer
+            phi = np.zeros((L, b - a), dtype=np.float32)
+            for degree in sorted({d for c in per_strip for d in c}):
+                values = np.array([c.get(degree, 0.0) for c in per_strip])
+                if not np.any(values):
+                    continue
+                along_range = (np.interp(n_axis[a:b], strip_centres, values)
+                               if len(strips) > 1 else np.full(b - a, values[0]))
+                phi += (legendre(u_seg, degree)[:, None]
+                        * along_range[None, :]).astype(np.float32)
+            phi[u_seg == 0.0, :] = 0.0
+            h_win = h_win * xp.exp(1j * backend.asarray(phi)).astype(h_win.dtype)
+            g_win = backend.fft_kernel_minus(h_win)
+            del h_win
+            out[t0:t1, a:b] = g_win[pad + (t0 - w0) : pad + (t1 - w0)]
+            del g_win
     return out
 
 
@@ -800,10 +809,14 @@ def correct_segments(backend: Backend, h, range_scale: np.ndarray | None = None,
                                        cubic_half=SECOND_PASS_CUBIC_HALF_RAD,
                                        degrees=SECOND_PASS_DEGREES)
             rows_used, hop_used = SECOND_PASS_ROWS, SECOND_PASS_HOP
-        scene = apply_segments(backend, h_current, segments, range_scale)
+        # полоса по сегментам — до применения, по текущей сцене; массивы
+        # сцены по 300+ МБ, лишние копии освобождаются сразу (прогон края
+        # кадра доходил до 6…8 ГБ и убивался по памяти)
         g_now = backend.fft_kernel_minus(h_current)
         bands = [segment_band_width(backend, g_now, s.row_start, s.row_stop)
                  for s in segments]
+        del g_now
+        scene = apply_segments(backend, h_current, segments, range_scale)
         passes_out.append({"segments": segments, "bands": bands,
                            "rows": rows_used, "hop": hop_used})
         h_current = backend.xp.fft.ifft(scene, axis=0) / backend.alpha
