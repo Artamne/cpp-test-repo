@@ -687,16 +687,22 @@ def apply_segments(backend: Backend, h, segments: list[SegmentResult],
         u_seg = np.where(np.abs(f_seg) <= edge, f_seg / edge, 0.0)
         # фаза (L, N): коэффициент каждой степени линейно интерполируется по
         # дальности между центрами полос, за крайними — постоянен
-        phi = np.zeros((L, N), dtype=np.float64)
+        # фаза (L, N) в одинарной точности: окно 8192 x 5660 в двойной
+        # вместе с экспонентой и произведением занимало ~3 ГБ на плитку, и
+        # прогон края кадра убивался по памяти (cgroup 8 ГБ). Точности
+        # float32 для фазы в сотни радиан хватает: шаг 3e-5 рад
+        phi = np.zeros((L, N), dtype=np.float32)
         for degree in sorted({d for c in per_strip for d in c}):
             values = np.array([c.get(degree, 0.0) for c in per_strip])
             if not np.any(values):
                 continue
             along_range = (np.interp(n_axis, strip_centres, values)
                            if len(strips) > 1 else np.full(N, values[0]))
-            phi += legendre(u_seg, degree)[:, None] * along_range[None, :]
+            phi += (legendre(u_seg, degree)[:, None] * along_range[None, :]).astype(np.float32)
         phi[u_seg == 0.0, :] = 0.0
-        g_win = backend.fft_kernel_minus(h_seg * xp.exp(1j * backend.asarray(phi)))
+        factor = xp.exp(1j * backend.asarray(phi)).astype(h_seg.dtype)
+        g_win = backend.fft_kernel_minus(h_seg * factor)
+        del factor
         out[t0:t1] = g_win[pad + (t0 - w0) : pad + (t1 - w0)]
     return out
 
