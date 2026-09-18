@@ -650,7 +650,16 @@ FIRST_PASS_DEGREES = (2,)
 SECOND_PASS_ROWS = 1024
 SECOND_PASS_HOP = 256
 SECOND_PASS_PRESCAN_HALF_RAD = 150.0
-SECOND_PASS_CUBIC_HALF_RAD = 60.0
+
+#: Кубическая во втором проходе ОТКЛЮЧЕНА (ноль — не ищется). Замер на
+#: крае кадра: второй проход находил кубическую -6…-140 рад с dS всего
+#: -0,003…-0,026 на окно, и цели в строках 1368…1798 от неё расплывались:
+#: -20 дБ 8,0 -> 8,4 при квадратичной с кубической против 8,0 -> 4,0 при
+#: одной квадратичной на сцену. Энтропия леса кубическую хочет, точечные
+#: цели — нет; верим целям. Остаток выше квадратичной снимает этап C по
+#: бинам блока.
+SECOND_PASS_CUBIC_HALF_RAD = 0.0
+SECOND_PASS_DEGREES = (2,)
 
 
 def segment_band_width(backend: Backend, g_scene, start: int, stop: int) -> tuple[float, float]:
@@ -703,7 +712,7 @@ def correct_segments(backend: Backend, h, range_scale: np.ndarray | None = None,
                                        SECOND_PASS_ROWS, SECOND_PASS_HOP,
                                        prescan_half=SECOND_PASS_PRESCAN_HALF_RAD,
                                        cubic_half=SECOND_PASS_CUBIC_HALF_RAD,
-                                       degrees=DEGREES)
+                                       degrees=SECOND_PASS_DEGREES)
             rows_used, hop_used = SECOND_PASS_ROWS, SECOND_PASS_HOP
         scene = apply_segments(backend, h_current, segments, range_scale)
         g_now = backend.fft_kernel_minus(h_current)
