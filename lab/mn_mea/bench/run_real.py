@@ -21,6 +21,12 @@
                     окрестностям целей, а не по всему блоку. На местности
                     без этого блок возвращает ноль: фон давит цели. По
                     умолчанию выключено, поведение книжное
+    pokaz=rezko     показ картинок «до/после» и итоговой mn_mea_kartinka.png:
+                    многовзгляд на элемент разрешения, выравнивание по
+                    дальности, нерезкое маскирование, S-кривая — вариант,
+                    выбранный владельцем в bench/playground_kontrast.py.
+                    По умолчанию pokaz=db — дБ, окно P5…P97, как было.
+                    На счёт и линейку не влияет: это только показ
     start=polinom   ЭТАП B БЕЗ ИНС (по умолчанию): начальная фаза phi^(0)
                     ищется как полином по энтропии всей сцены
                     (stage_b_search.py), и этап C идёт из неё. start=nol —
@@ -54,6 +60,7 @@
 Порядок функций — порядок выполнения:
 
     read_slice          прочитать куски h_srez*.npy и meta.json, склеить
+    render_rezko        показ pokaz=rezko: многовзгляд, выравнивание, маскирование, S-кривая
     geometry_from_meta  Geometry из паспорта, разрешение отдельно от шага
     focus               блоки, этап B без ИНС, этап C, этап D
     grid_agreement      сверка нарезки с ожиданием паспорта
@@ -89,6 +96,26 @@ from validate import image_sharpness, phase_residual_rms, truth_on_block_grid
 #: Процентили для границ показа. Не нормировка по максимуму: см.
 #: display_window, там замер, почему максимум даёт чёрную картинку.
 DISPLAY_LOW, DISPLAY_HIGH = 5.0, 97.0
+
+#: Режим показа pokaz=rezko — вариант (е) из bench/playground_kontrast.py,
+#: выбранный владельцем глазами из шестнадцати: многовзгляд по азимуту на
+#: элемент разрешения (r_a/шаг, у владельца 7), выравнивание яркости по
+#: дальности, дБ, нерезкое маскирование, S-кривая. Пространственного
+#: сглаживания нет: при одном взгляде спекл — либо зерно, либо мыло, и
+#: фильтры спекла (Ли) владелец отверг: «жёстко замылили».
+#:
+#: Числа — из песочницы, там же замеры. Выравнивание по дальности:
+#: медианный профиль в дБ (средний ловит цели и оставляет полосы),
+#: сглаженный окном 201 строб, поправка не больше 6 дБ.
+POKAZ_RANGE_SMOOTH_GATES = 201
+POKAZ_RANGE_LIMIT_DB = 6.0
+#: Нерезкое маскирование: dB + вес * (dB - среднее по окну 9x9), окно на
+#: сетке после многовзгляда — 3,6 x 2,7 м.
+POKAZ_UNSHARP_WIN = 9
+POKAZ_UNSHARP_AMOUNT = 0.4
+#: S-кривая 1/(1+exp(-(dB - медиана)/наклон)): наклон 4 дБ — из четырёх
+#: пробованных (4 и 6 с маскированием и без) выбран владельцем.
+POKAZ_SIGMOID_SLOPE_DB = 4.0
 
 #: Сколько самых ярких одиночных целей меряет линейка размаза. Восемь —
 #: чтобы медиана была устойчива к тому, что одна-две «цели» окажутся
@@ -170,7 +197,7 @@ def parse_options(words: list[str]) -> tuple:
     """Разобрать аргументы после пути.
 
     Принимает слова; возвращает (сетка, mu, проба, предел итераций, общая ли
-    фаза, доля целей, откуда стартовать).
+    фаза, доля целей, откуда стартовать, режим показа).
 
     Позиционные и именованные мешаются свободно, и правило простое: слово с
     '=' — именованное; слово вида ЧИСЛОxЧИСЛО — сетка; голое число — сперва
@@ -181,6 +208,7 @@ def parse_options(words: list[str]) -> tuple:
     grid, mu, probe = None, MU_REAL, 0.0
     iterations, shared, targets = C.MAX_ITERATIONS, False, None
     start = "polinom"
+    pokaz = "db"
     bare = 0
     for word in words:
         if "=" in word:
@@ -204,9 +232,13 @@ def parse_options(words: list[str]) -> tuple:
                 if value not in ("polinom", "nol"):
                     sys.exit(f"start={value}: есть polinom и nol")
                 start = value
+            elif name == "pokaz":
+                if value not in ("db", "rezko"):
+                    sys.exit(f"pokaz={value}: есть db и rezko")
+                pokaz = value
             else:
                 sys.exit(f"неизвестный аргумент {name!r}; есть setka, mu, "
-                         "proba, iter, faza, celi, start")
+                         "proba, iter, faza, celi, start, pokaz")
         elif re.fullmatch(r"\d+[xX]\d+", word):
             a, b = word.lower().split("x")
             grid = (int(a), int(b))
@@ -219,7 +251,7 @@ def parse_options(words: list[str]) -> tuple:
             else:
                 sys.exit(f"лишнее число {word!r}: голыми идут только mu и проба")
             bare += 1
-    return grid, mu, probe, iterations, shared, targets, start
+    return grid, mu, probe, iterations, shared, targets, start, pokaz
 
 
 def read_slice(directory: pathlib.Path) -> tuple[np.ndarray, dict]:
@@ -622,6 +654,48 @@ def probe_phase(backend, h: np.ndarray, edge_rad: float) -> tuple[np.ndarray, fl
     return edge_rad * (u / u_band) ** 2 * inside, u_band
 
 
+def box_mean(a: np.ndarray, win: tuple[int, int]) -> np.ndarray:
+    """Среднее по прямоугольному окну через интегральное изображение (scipy нет)."""
+    wm, wn = win
+    pm, pn = wm // 2, wn // 2
+    p = np.pad(a.astype(np.float64), ((pm, wm - pm), (pn, wn - pn)), mode="reflect")
+    c = np.pad(np.cumsum(np.cumsum(p, axis=0), axis=1), ((1, 0), (1, 0)))
+    s = c[wm:, wn:] - c[:-wm, wn:] - c[wm:, :-wn] + c[:-wm, :-wn]
+    return (s / (wm * wn))[: a.shape[0], : a.shape[1]]
+
+
+def multilook_azimuth(intensity: np.ndarray, looks: int) -> np.ndarray:
+    """Усреднение интенсивности по looks соседним строкам — пиксель в элемент разрешения."""
+    M = intensity.shape[0] // looks * looks
+    return intensity[:M].reshape(M // looks, looks, intensity.shape[1]).mean(axis=1)
+
+
+def flatten_range_db(db: np.ndarray, gates: int = POKAZ_RANGE_SMOOTH_GATES,
+                     limit_db: float = POKAZ_RANGE_LIMIT_DB) -> np.ndarray:
+    """Выравнивание яркости по дальности: минус сглаженный медианный профиль, не больше limit_db."""
+    profile = np.median(db, axis=0)
+    kernel = np.ones(gates) / gates
+    smooth = np.convolve(np.pad(profile, gates // 2, mode="edge"), kernel, mode="valid")[: profile.size]
+    return db + np.clip(smooth.mean() - smooth, -limit_db, limit_db)[None, :]
+
+
+def render_rezko(images: list[np.ndarray], looks: int) -> list[np.ndarray]:
+    """Показ pokaz=rezko для нескольких картинок ОДНОЙ кривой — иначе сравнение ложно.
+
+    Принимает список комплексных изображений и число взглядов по азимуту;
+    возвращает список массивов 0…1 на сетке после многовзгляда. Центр
+    S-кривой — медиана ПЕРВОЙ картинки (это «до»), одна для всех.
+    """
+    dbs = []
+    for image in images:
+        intensity = multilook_azimuth(np.abs(image).astype(np.float64) ** 2, looks)
+        db = 10.0 * np.log10(np.maximum(intensity, intensity.max() * 1e-9))
+        db = flatten_range_db(db)
+        dbs.append(db + POKAZ_UNSHARP_AMOUNT * (db - box_mean(db, (POKAZ_UNSHARP_WIN, POKAZ_UNSHARP_WIN))))
+    centre = float(np.median(dbs[0]))
+    return [1.0 / (1.0 + np.exp(-(db - centre) / POKAZ_SIGMOID_SLOPE_DB)) for db in dbs]
+
+
 def contrast(image: np.ndarray) -> float:
     """Контраст картинки: sqrt(<I^2>)/<I> по интенсивности. Больше — резче.
 
@@ -637,7 +711,7 @@ def main() -> int:
         print(__doc__)
         return 2
     directory = pathlib.Path(sys.argv[1])
-    grid, mu, probe, iterations, shared, targets, start = parse_options(sys.argv[2:])
+    grid, mu, probe, iterations, shared, targets, start, pokaz = parse_options(sys.argv[2:])
 
     h, meta = read_slice(directory)
     geom = geometry_from_meta(meta)
@@ -852,23 +926,46 @@ def main() -> int:
         import matplotlib.pyplot as plt
 
         fig, axes = plt.subplots(1, 2, figsize=(13, 6.5))
-        # окно показа считается по картинке ДО и применяется к обеим: разные
-        # шкалы сделали бы сравнение ложным
-        vmin, vmax = display_window(np.abs(before))
-        floor = float(np.abs(before).max()) * 1e-6
-        for ax, image, title in ((axes[0], before, "до"), (axes[1], after, "после")):
-            db = 20 * np.log10(np.maximum(np.abs(image), floor))
-            ax.imshow(db, aspect="auto", cmap="gray", vmin=vmin, vmax=vmax)
-            ax.set_title(f"{title}, контраст {contrast(image):.2f}")
-            ax.set_xlabel("строб дальности n")
-            ax.set_ylabel("азимут m")
-        fig.suptitle(f"MN-MEA на реальной записи, сетка {run['M_k']}x{run['N_k']}"
-                     f"; показ {vmin:.0f} … {vmax:.0f} дБ, окно "
-                     f"P{DISPLAY_LOW:g}-P{DISPLAY_HIGH:g}, общее для обеих")
+        if pokaz == "rezko":
+            looks = max(int(round(geom.r_a / geom.azimuth_step)), 1)
+            shown_before, shown_after = render_rezko([before, after], looks)
+            for ax, shown, image, title in ((axes[0], shown_before, before, "до"),
+                                            (axes[1], shown_after, after, "после")):
+                ax.imshow(shown, aspect="auto", cmap="gray", vmin=0, vmax=1)
+                ax.set_title(f"{title}, контраст {contrast(image):.2f}")
+                ax.set_xlabel("строб дальности n")
+                ax.set_ylabel(f"азимут, строки по {looks} отсчётов")
+            fig.suptitle(f"MN-MEA на реальной записи, сетка {run['M_k']}x{run['N_k']}"
+                         f"; показ rezko: многовзгляд x{looks}, выравнивание, "
+                         f"маскирование {POKAZ_UNSHARP_WIN}x{POKAZ_UNSHARP_WIN} "
+                         f"x{POKAZ_UNSHARP_AMOUNT:g}, S-кривая {POKAZ_SIGMOID_SLOPE_DB:g} дБ, "
+                         "одна для обеих")
+            # итоговая картинка «после» целиком, 1:1 на сетке после многовзгляда,
+            # пиксель looks*шаг по азимуту на r_b по дальности
+            from PIL import Image
+            kartinka = directory / "mn_mea_kartinka.png"
+            Image.fromarray((np.clip(shown_after, 0, 1) * 255).astype(np.uint8)).save(kartinka)
+        else:
+            # окно показа считается по картинке ДО и применяется к обеим: разные
+            # шкалы сделали бы сравнение ложным
+            vmin, vmax = display_window(np.abs(before))
+            floor = float(np.abs(before).max()) * 1e-6
+            for ax, image, title in ((axes[0], before, "до"), (axes[1], after, "после")):
+                db = 20 * np.log10(np.maximum(np.abs(image), floor))
+                ax.imshow(db, aspect="auto", cmap="gray", vmin=vmin, vmax=vmax)
+                ax.set_title(f"{title}, контраст {contrast(image):.2f}")
+                ax.set_xlabel("строб дальности n")
+                ax.set_ylabel("азимут m")
+            fig.suptitle(f"MN-MEA на реальной записи, сетка {run['M_k']}x{run['N_k']}"
+                         f"; показ {vmin:.0f} … {vmax:.0f} дБ, окно "
+                         f"P{DISPLAY_LOW:g}-P{DISPLAY_HIGH:g}, общее для обеих")
         fig.tight_layout()
         out = directory / "mn_mea_do_posle.png"
         fig.savefig(out, dpi=120)
         print(f"картинка: {out}")
+        if pokaz == "rezko":
+            print(f"итоговая: {kartinka}  (после, 1:1: строка = {looks} отсчётов = "
+                  f"{looks * geom.azimuth_step:.2f} м, столбец = {geom.r_b:.2f} м)")
 
         # срезы по азимуту через самые яркие цели: то же, что меряет
         # линейка, но глазами. Уровень в дБ от собственного пика каждой
