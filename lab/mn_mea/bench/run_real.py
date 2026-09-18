@@ -663,8 +663,17 @@ def main() -> int:
 
     run = focus(h, geom, grid, mu=mu, max_iterations=iterations,
                 shared_phase=shared, target_fraction=targets, start=start)
-    print(f"\nсетка блоков {run['M_k']}x{run['N_k']}, порог (5-9) mu = {mu:g}, "
-          f"предел {iterations} итераций"
+    book_grid = inputs.derived_numbers(geom, *h.shape)
+    book = f"{book_grid['blocks_azimuth']:.0f}x{book_grid['blocks_range']:.0f}"
+    origin = (f"задана рукой, по (5-20) было бы {book}" if grid is not None
+              else "по (5-20)")
+    # блок по дальности в зону скорости продукта (RANGE_STRIP_GATES стробов)
+    # даёт прирост: у владельца 37x4 против 37x2 — контраст 12,20 против
+    # 11,97, ISLR -8,96; край кадра 27x6 против 27x2 — 6,06 против 5,65
+    by_zones = f"{book_grid['blocks_azimuth']:.0f}x{len(BS.range_strips(h.shape[1]))}"
+    print(f"\nсетка блоков {run['M_k']}x{run['N_k']} ({origin}; по зонам скорости "
+          f"продукта, блок {BS.RANGE_STRIP_GATES} стробов по дальности — setka={by_zones}), "
+          f"порог (5-9) mu = {mu:g}, предел {iterations} итераций"
           + (f", критерий по целям ({100*targets:g} % стробов, решение №9)"
              if targets else ""))
     if run["initial"] is not None:
