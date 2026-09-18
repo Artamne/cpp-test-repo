@@ -36,6 +36,10 @@
     scene_entropy      (5-6) по всей сцене при данной phi — одно БПФ
     refine_coefficient один коэффициент: перебор с шагом, потом парабола
     search             широкий скан квадратичной, сетка по двум степеням, уточнение
+    segment_bounds     границы сегментов по азимуту
+    segment_data       сегмент сцены с полями в области дальность-доплер
+    search_segments    своя (P2, P3) на каждый сегмент
+    apply_segments     исправленная сцена, склейка сегментов окнами sin^2
 """
 
 from __future__ import annotations
@@ -269,7 +273,10 @@ def search(backend: Backend, h, degrees=DEGREES, step_initial: float = STEP_INIT
            floor_relative: float = C.POWER_FLOOR_RELATIVE,
            range_scale: np.ndarray | None = None,
            prescan_half: float = PRESCAN_HALF_RAD,
-           prescan_step: float = PRESCAN_STEP_RAD) -> SearchResult:
+           prescan_step: float = PRESCAN_STEP_RAD,
+           cubic_prescan_half: float = 0.0,
+           grid_half_steps: int = GRID_HALF_STEPS,
+           band_override: np.ndarray | None = None) -> SearchResult:
     """Поиск полинома по энтропии сцены: широкий скан, сетка, уточнение.
 
     Принимает бэкенд, данные сцены h(k,n) и, если есть, вектор R_n / R_B0
@@ -291,6 +298,9 @@ def search(backend: Backend, h, degrees=DEGREES, step_initial: float = STEP_INIT
     h_device = backend.asarray(h)
     M, N = h_device.shape
     u, edge, n_band = band_axis(backend, h_device, floor_factor)
+    if band_override is not None:  # сегмент: полоса задана по всей сцене
+        u = band_override
+        n_band = int(np.count_nonzero(u))
     h_abs2 = backend.xp.abs(h_device) ** 2
     S_g = C.total_energy(backend, h_abs2, M)
     floor = C.power_floor(S_g, M, N, floor_relative)
@@ -334,15 +344,29 @@ def search(backend: Backend, h, degrees=DEGREES, step_initial: float = STEP_INIT
         coefficients[d_a] = best_c
         history.append((-1, d_a, best_c, float(best_thin)))
 
+    # ступень 1б: то же для кубической, если просили (сегменты края кадра)
+    if cubic_prescan_half > 0.0 and len(degrees) > 1:
+        d_c = degrees[1]
+        best_thin, best_c = None, 0.0
+        n_steps = int(round(cubic_prescan_half / prescan_step))
+        for k in range(-n_steps, n_steps + 1):
+            coefficients[d_c] = k * prescan_step
+            S_thin = evaluate_thin(coefficients)
+            if best_thin is None or S_thin < best_thin:
+                best_thin, best_c = S_thin, coefficients[d_c]
+        coefficients[d_c] = best_c
+        history.append((-1, d_c, best_c, float(best_thin)))
+
     # ступень 2: грубая сетка по ПЕРВЫМ ДВУМ степеням вокруг найденного
     # (остальные в нуле): ищет ложбину, в которой потом уточняться
-    grid = [k * step_initial for k in range(-GRID_HALF_STEPS, GRID_HALF_STEPS + 1)]
+    grid = [k * step_initial for k in range(-grid_half_steps, grid_half_steps + 1)]
     centre_a = coefficients[d_a]
-    S_now, best = evaluate(coefficients), dict(coefficients)
     d_b = degrees[1] if len(degrees) > 1 else degrees[0]
+    centre_b = coefficients[d_b] if d_b != d_a else 0.0
+    S_now, best = evaluate(coefficients), dict(coefficients)
     for c_a in grid:
         for c_b in (grid if d_b != d_a else [0.0]):
-            coefficients[d_a], coefficients[d_b] = centre_a + c_a, c_b
+            coefficients[d_a], coefficients[d_b] = centre_a + c_a, centre_b + c_b
             S_here = evaluate(coefficients)
             if S_here < S_now:
                 S_now, best = S_here, dict(coefficients)
@@ -368,3 +392,212 @@ def search(backend: Backend, h, degrees=DEGREES, step_initial: float = STEP_INIT
         band_edge=edge,
         n_band_bins=n_band,
     )
+
+
+# ------------------------------------------------------------- вдоль азимута
+
+#: Длина сегмента по азимуту для посегментной поправки, строк. Сегмент
+#: обязан быть длиннее размаза: при a рад квадратичной на краю полосы
+#: точка размазана на 2a/(pi*край) отсчётов — при a = 300 и крае 0,12 это
+#: 1600 строк. 2048 с нулевыми полями по половине с каждой стороны
+#: (SEGMENT_PAD_FRACTION) накрывают такой размаз без кругового наложения.
+#: Ошибка внутри сегмента считается одной: замер профиля на крае кадра
+#: владельца — 120, 140, 220, 540, 630, 930 рад по окнам через 768 строк,
+#: то есть за 2048 строк она меняется до двух раз; остаток от этого
+#: снимают блоки этапа C.
+SEGMENT_ROWS = 2048
+
+#: Сдвиг между сегментами — половина длины: окна sin^2 при таком шаге
+#: складываются ровно в единицу, и склейка не оставляет швов.
+SEGMENT_HOP = SEGMENT_ROWS // 2
+
+#: Нули с каждой стороны сегмента, в долях его длины, против кругового
+#: наложения при большой поправке (см. SEGMENT_ROWS).
+SEGMENT_PAD_FRACTION = 0.5
+
+#: Широкий скан по сегменту: полуширина и шаг для квадратичной и для
+#: кубической. Край кадра владельца — до 930 рад квадратичной.
+SEGMENT_PRESCAN_HALF_RAD = 1200.0
+SEGMENT_PRESCAN_STEP_RAD = 15.0
+SEGMENT_CUBIC_HALF_RAD = 300.0
+
+#: Сетка вокруг найденного при посегментном поиске: +-2 шага, 5 x 5.
+#: После скана с шагом 15 этого хватает, а 9 x 9 на семи сегментах
+#: обошлась бы в 570 БПФ сегмента.
+SEGMENT_GRID_HALF_STEPS = 2
+
+
+@dataclass
+class SegmentResult:
+    """Поправка одного сегмента."""
+
+    row_start: int
+    row_stop: int
+    coefficients: dict[int, float]
+    entropy_start: float
+    entropy_final: float
+    n_evaluations: int
+
+
+def segment_bounds(M: int, rows: int = SEGMENT_ROWS, hop: int = SEGMENT_HOP) -> list[tuple[int, int]]:
+    """Границы сегментов: длина rows, шаг hop, последний прижат к концу.
+
+    Принимает число строк сцены; возвращает список (start, stop). Сцена
+    короче сегмента — один сегмент на всю.
+    """
+    if M <= rows:
+        return [(0, M)]
+    starts = list(range(0, M - rows + 1, hop))
+    if starts[-1] + rows < M:
+        starts.append(M - rows)
+    return [(s, s + rows) for s in starts]
+
+
+def segment_data(backend: Backend, g_scene, start: int, stop: int,
+                 pad_fraction: float = SEGMENT_PAD_FRACTION):
+    """Сегмент сцены с нулевыми полями, в области дальность-доплер.
+
+    Принимает бэкенд, изображение сцены и границы строк; возвращает
+    (h_seg, pad) — данные длины (stop - start) + 2 pad и ширину поля.
+    """
+    rows = stop - start
+    pad = int(round(pad_fraction * rows))
+    buffer = backend.xp.zeros((rows + 2 * pad, g_scene.shape[1]), dtype=g_scene.dtype)
+    buffer[pad : pad + rows] = g_scene[start:stop]
+    return backend.xp.fft.ifft(buffer, axis=0) / backend.alpha, pad
+
+
+def search_segments(backend: Backend, h, range_scale: np.ndarray | None = None,
+                    rows: int = SEGMENT_ROWS, hop: int = SEGMENT_HOP,
+                    floor_factor: float = C.SIGNAL_FLOOR_FACTOR,
+                    floor_relative: float = C.POWER_FLOOR_RELATIVE) -> list[SegmentResult]:
+    """Посегментный поиск полинома: своя (P2, P3) на каждый сегмент азимута.
+
+    Принимает бэкенд, данные сцены h(k,n) и масштаб дальности; возвращает
+    список SegmentResult по сегментам (segment_bounds).
+
+    Зачем не одна фаза на сцену: на крае кадра владельца квадратичная
+    ошибка растёт вдоль азимута от 120 до 930 рад — одна поправка на
+    сцену подошла бы одному месту и испортила бы остальные. Полоса
+    доплера (край u = 1) берётся по ВСЕЙ сцене, одна для всех сегментов:
+    у сегмента она та же, только сетка реже.
+
+    Каждый сегмент: широкий скан квадратичной (SEGMENT_PRESCAN_*), скан
+    кубической (SEGMENT_CUBIC_HALF_RAD), сетка 5 x 5, уточнение — то же
+    search(), только с полями и на сетке сегмента.
+    """
+    h_device = backend.asarray(h)
+    M, N = h_device.shape
+    _, edge, _ = band_axis(backend, h_device, floor_factor)
+    g_scene = backend.fft_kernel_minus(h_device)
+    results = []
+    for start, stop in segment_bounds(M, rows, hop):
+        h_seg, pad = segment_data(backend, g_scene, start, stop)
+        L = h_seg.shape[0]
+        f_seg = np.fft.fftfreq(L)
+        u_seg = np.where(np.abs(f_seg) <= edge, f_seg / edge, 0.0)
+        result = search(backend, h_seg, range_scale=range_scale,
+                        prescan_half=SEGMENT_PRESCAN_HALF_RAD,
+                        prescan_step=SEGMENT_PRESCAN_STEP_RAD,
+                        cubic_prescan_half=SEGMENT_CUBIC_HALF_RAD,
+                        grid_half_steps=SEGMENT_GRID_HALF_STEPS,
+                        band_override=u_seg)
+        results.append(SegmentResult(start, stop, dict(result.coefficients),
+                                     result.entropy_start, result.entropy_final,
+                                     result.n_evaluations))
+    return results
+
+
+def apply_segments(backend: Backend, h, segments: list[SegmentResult],
+                   range_scale: np.ndarray | None = None,
+                   floor_factor: float = C.SIGNAL_FLOOR_FACTOR):
+    """Исправленная сцена: каждый сегмент со своей поправкой, склейка окнами sin^2.
+
+    Принимает бэкенд, данные сцены и список поправок; возвращает
+    изображение сцены (M, N) на устройстве, готовое к нарезке на блоки.
+
+    Сегмент исправляется в своей области дальность-доплер (с полями), из
+    него берётся середина без полей, домножается на окно sin^2 и
+    складывается в сцену; сумма окон при шаге в полсегмента равна единице
+    внутри, у краёв сцены нормируется явно.
+    """
+    h_device = backend.asarray(h)
+    M, N = h_device.shape
+    _, edge, _ = band_axis(backend, h_device, floor_factor)
+    g_scene = backend.fft_kernel_minus(h_device)
+    xp = backend.xp
+    out = xp.zeros_like(g_scene)
+    weight = xp.zeros((M, 1), dtype=backend.real_dtype)
+    for seg in segments:
+        start, stop = seg.row_start, seg.row_stop
+        h_seg, pad = segment_data(backend, g_scene, start, stop)
+        L = h_seg.shape[0]
+        f_seg = np.fft.fftfreq(L)
+        u_seg = np.where(np.abs(f_seg) <= edge, f_seg / edge, 0.0)
+        phi = polynomial_phase(u_seg, seg.coefficients, range_scale)
+        phi_device = backend.asarray(phi)
+        if phi_device.ndim == 1:
+            phi_device = phi_device[:, None]
+        g_seg = backend.fft_kernel_minus(h_seg * xp.exp(1j * phi_device))
+        rows = stop - start
+        window = xp.asarray(np.sin(np.pi * (np.arange(rows) + 0.5) / rows) ** 2,
+                            dtype=backend.real_dtype)[:, None]
+        out[start:stop] += g_seg[pad : pad + rows] * window
+        weight[start:stop] += window
+    weight = xp.maximum(weight, 1e-6)
+    return out / weight
+
+
+#: Проходов посегментной поправки. Внутри сегмента ошибка не одна, а плавно
+#: меняется, и первый проход находит её с перебором: замер с внесённой
+#: растущей 100…500 рад — найдено 237/319/371 при 168/237/305. Второй
+#: проход идёт по уже исправленной сцене, где остаток в разы меньше и
+#: внутри сегмента почти постоянен. Третий проход на том же замере
+#: ничего не добавлял.
+SEGMENT_PASSES = 2
+
+
+def segment_band_width(backend: Backend, g_scene, start: int, stop: int) -> tuple[float, float]:
+    """Ширина полосы -10 дБ и её центр в сегменте, в долях частоты повторения.
+
+    Принимает бэкенд, изображение сцены и строки; возвращает (ширина, центр).
+    Зачем: у края кадра апертура неполная, и полоса сужается — там
+    поправка не поможет, и об этом надо печатать, а не молчать.
+    """
+    xp = backend.xp
+    rows = stop - start
+    window = xp.asarray(np.hanning(rows), dtype=backend.real_dtype)[:, None]
+    spectrum = backend.to_numpy(
+        (xp.abs(xp.fft.fft(g_scene[start:stop] * window, axis=0)) ** 2).sum(axis=1))
+    f = np.fft.fftfreq(rows)
+    band = spectrum > spectrum.max() / 10.0
+    width = float(band.sum()) / rows
+    centre = float(np.sum(f[band] * spectrum[band]) / max(np.sum(spectrum[band]), 1e-300))
+    return width, centre
+
+
+def correct_segments(backend: Backend, h, range_scale: np.ndarray | None = None,
+                     passes: int = SEGMENT_PASSES,
+                     rows: int = SEGMENT_ROWS, hop: int = SEGMENT_HOP):
+    """Посегментная поправка в несколько проходов.
+
+    Принимает бэкенд, данные сцены и масштаб дальности; возвращает
+    (исправленное изображение сцены на устройстве, список проходов, где
+    каждый проход — список SegmentResult, полоса по сегментам).
+
+    Каждый проход: search_segments на текущих данных, apply_segments,
+    и следующий проход идёт по исправленной сцене (обратное ПФ по азимуту
+    возвращает её в область дальность-доплер).
+    """
+    h_current = backend.asarray(h)
+    passes_out = []
+    scene = None
+    for _ in range(max(passes, 1)):
+        segments = search_segments(backend, h_current, range_scale, rows, hop)
+        scene = apply_segments(backend, h_current, segments, range_scale)
+        passes_out.append(segments)
+        h_current = backend.xp.fft.ifft(scene, axis=0) / backend.alpha
+    g_scene = backend.fft_kernel_minus(backend.asarray(h))
+    bands = [segment_band_width(backend, g_scene, s.row_start, s.row_stop)
+             for s in passes_out[0]]
+    return scene, passes_out, bands

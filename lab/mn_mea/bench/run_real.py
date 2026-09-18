@@ -390,13 +390,20 @@ def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
     # сцене. Это то же самое, что стартовать этап C из phi^(0), пока phi^(0)
     # зависит только от бина; с дальностью иначе нельзя — у этапа C фаза
     # одна на все стробы блока. Итог для блока: phi^(0)(k, n) + phi_C(k).
-    initial = None
+    initial, segments, bands = None, None, None
     scene_corrected = scene
     if start == "polinom":
         range_scale = BS.range_scale_axis(geom.R_B0, geom.r_b, N)
-        initial = BS.search(backend, h_device, range_scale=range_scale)
-        h_corrected = h_device * backend.xp.exp(1j * backend.asarray(initial.phi))
-        scene_corrected = A.scene_image(backend, h_corrected)
+        if M >= 2 * BS.SEGMENT_ROWS:
+            # длинный срез: ошибка меняется вдоль азимута (край кадра
+            # владельца: 120 -> 930 рад за 4000 строк), одна фаза на сцену
+            # не годится — поправка по сегментам, SEGMENT_PASSES проходов
+            scene_corrected, segments, bands = BS.correct_segments(
+                backend, h_device, range_scale)
+        else:
+            initial = BS.search(backend, h_device, range_scale=range_scale)
+            h_corrected = h_device * backend.xp.exp(1j * backend.asarray(initial.phi))
+            scene_corrected = A.scene_image(backend, h_corrected)
 
     # первый проход: каждый блок ищет свою фазу
     rows = []
@@ -446,6 +453,7 @@ def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
     return {
         "blocks": blocks, "M_k": M_k, "N_k": N_k, "per_block": rows,
         "m_p": m_p, "n_p": n_p, "donor": donor, "initial": initial,
+        "segments": segments, "bands": bands,
         "image_before": backend.to_numpy(D.assemble(backend, before, blocks, M, N)),
         "image_after": backend.to_numpy(D.assemble(backend, after, blocks, M, N)),
         "backend": backend,
@@ -677,6 +685,29 @@ def main() -> int:
         print(f"  квадратичная {a_quadratic:+.1f} рад на краю полосы при полной фазе "
               f"апертуры {phi_aperture:.0f} рад — это ошибка скорости продукта "
               f"около {dv:+.2f} м/с (грубо, в полтора раза)")
+    elif run["segments"] is not None:
+        phi_ap = (math.pi * geom.v_x0 ** 2 * geom.T_a ** 2
+                  / (2.0 * geom.lambda_ * geom.R_B0))
+        print(f"этап B без ИНС ПО СЕГМЕНТАМ ({BS.SEGMENT_ROWS} строк, шаг "
+              f"{BS.SEGMENT_HOP}, проходов {len(run['segments'])}): своя поправка "
+              f"на каждый сегмент азимута, полная фаза апертуры {phi_ap:.0f} рад")
+        print(f"{'строки':>13} {'полоса -10дБ':>13} {'квадр., рад':>12} "
+              f"{'куб., рад':>10} {'dS':>8} {'  что это'}")
+        for i, seg in enumerate(run["segments"][0]):
+            total = {2: 0.0, 3: 0.0}
+            for pass_segments in run["segments"]:
+                s = pass_segments[i]
+                total[2] += 1.5 * s.coefficients.get(2, 0.0)
+                total[3] += 2.5 * s.coefficients.get(3, 0.0)
+            width, centre = run["bands"][i]
+            dS = sum(p[i].entropy_final - p[i].entropy_start for p in run["segments"])
+            note = ""
+            if width < 0.6 * run["bands"][0][0]:
+                note = "полоса урезана — апертура неполная, край кадра"
+            elif abs(total[2]) > 0.25 * phi_ap:
+                note = f"ошибка {abs(total[2])/phi_ap*100:.0f} % фазы апертуры — не движение, опорная функция продукта"
+            print(f"{seg.row_start:5d}…{seg.row_stop:<7d} {width*100:12.1f} % {total[2]:+12.0f} "
+                  f"{total[3]:+10.0f} {dS:+8.4f}  {note}")
     else:
         print("начальная фаза нулевая (start=nol), этап B не делается")
     if run["donor"] is not None:
