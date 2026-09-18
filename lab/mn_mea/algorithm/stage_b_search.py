@@ -407,13 +407,36 @@ def search(backend: Backend, h, degrees=DEGREES, step_initial: float = STEP_INIT
 #: снимают блоки этапа C.
 SEGMENT_ROWS = 2048
 
-#: Сдвиг между сегментами — половина длины: окна sin^2 при таком шаге
-#: складываются ровно в единицу, и склейка не оставляет швов.
-SEGMENT_HOP = SEGMENT_ROWS // 2
+#: Сдвиг между сегментами — четверть длины. При половине соседние
+#: поправки на крае кадра (150 и 510 рад через 1024 строки) смешивались
+#: окнами sin^2 в широкой зоне, и на картинке шли горизонтальные полосы
+#: по стыкам. При четверти в каждой строке складываются четыре сегмента,
+#: поправка вдоль азимута меняется плавнее; сумма окон нормируется явно.
+SEGMENT_HOP = SEGMENT_ROWS // 4
 
-#: Нули с каждой стороны сегмента, в долях его длины, против кругового
-#: наложения при большой поправке (см. SEGMENT_ROWS).
+#: Нули с каждой стороны сегмента ПРИ ПРИМЕНЕНИИ поправки, в долях длины,
+#: против кругового наложения.
 SEGMENT_PAD_FRACTION = 0.5
+
+#: Нули при ПОИСКЕ — ноль, сегмент кольцевой. Замер на крае кадра
+#: владельца, скан квадратичной ±1200 рад:
+#:
+#:   сегмент       с полями 0,5     без полей
+#:   2048…4096     0 (dS 0)         +510 (dS -0,085)
+#:   3072…5120     0 (dS 0)         +690 (dS -0,113)
+#:   2048…6144     0 (dS 0)         +570 (dS -0,045)
+#:
+#: При размазе в +-1400…1800 строк поправка выталкивает энергию краёв
+#: сегмента в поля, энтропия буфера от этого растёт и прячет впадину. В
+#: кольцевом окне энергия остаётся внутри, и впадина видна. Применять
+#: поправку кольцевым окном нельзя — края наложатся, — поэтому поиск и
+#: применение идут с разными полями.
+SEGMENT_SEARCH_PAD_FRACTION = 0.0
+
+#: Сегмент, у которого полоса -10 дБ уже этой доли от самой широкой по
+#: сцене, не ищется и не правится: там апертура неполная (край кадра),
+#: поправки нет по построению, а поиск на обрезанной полосе вернул бы шум.
+SEGMENT_BAND_MIN_FRACTION = 0.6
 
 #: Широкий скан по сегменту: полуширина и шаг для квадратичной и для
 #: кубической. Край кадра владельца — до 930 рад квадратичной.
@@ -470,7 +493,9 @@ def segment_data(backend: Backend, g_scene, start: int, stop: int,
 def search_segments(backend: Backend, h, range_scale: np.ndarray | None = None,
                     rows: int = SEGMENT_ROWS, hop: int = SEGMENT_HOP,
                     floor_factor: float = C.SIGNAL_FLOOR_FACTOR,
-                    floor_relative: float = C.POWER_FLOOR_RELATIVE) -> list[SegmentResult]:
+                    floor_relative: float = C.POWER_FLOOR_RELATIVE,
+                    prescan_half: float = SEGMENT_PRESCAN_HALF_RAD,
+                    cubic_half: float = SEGMENT_CUBIC_HALF_RAD) -> list[SegmentResult]:
     """Посегментный поиск полинома: своя (P2, P3) на каждый сегмент азимута.
 
     Принимает бэкенд, данные сцены h(k,n) и масштаб дальности; возвращает
@@ -490,16 +515,23 @@ def search_segments(backend: Backend, h, range_scale: np.ndarray | None = None,
     M, N = h_device.shape
     _, edge, _ = band_axis(backend, h_device, floor_factor)
     g_scene = backend.fft_kernel_minus(h_device)
+    bounds = segment_bounds(M, rows, hop)
+    widths = [segment_band_width(backend, g_scene, s, e)[0] for s, e in bounds]
+    widest = max(widths) if widths else 1.0
     results = []
-    for start, stop in segment_bounds(M, rows, hop):
-        h_seg, pad = segment_data(backend, g_scene, start, stop)
+    for (start, stop), width in zip(bounds, widths):
+        if width < SEGMENT_BAND_MIN_FRACTION * widest:
+            results.append(SegmentResult(start, stop, {2: 0.0, 3: 0.0}, 0.0, 0.0, 0))
+            continue
+        h_seg, pad = segment_data(backend, g_scene, start, stop,
+                                  SEGMENT_SEARCH_PAD_FRACTION)
         L = h_seg.shape[0]
         f_seg = np.fft.fftfreq(L)
         u_seg = np.where(np.abs(f_seg) <= edge, f_seg / edge, 0.0)
         result = search(backend, h_seg, range_scale=range_scale,
-                        prescan_half=SEGMENT_PRESCAN_HALF_RAD,
+                        prescan_half=prescan_half,
                         prescan_step=SEGMENT_PRESCAN_STEP_RAD,
-                        cubic_prescan_half=SEGMENT_CUBIC_HALF_RAD,
+                        cubic_prescan_half=cubic_half,
                         grid_half_steps=SEGMENT_GRID_HALF_STEPS,
                         band_override=u_seg)
         results.append(SegmentResult(start, stop, dict(result.coefficients),
@@ -592,8 +624,13 @@ def correct_segments(backend: Backend, h, range_scale: np.ndarray | None = None,
     h_current = backend.asarray(h)
     passes_out = []
     scene = None
-    for _ in range(max(passes, 1)):
-        segments = search_segments(backend, h_current, range_scale, rows, hop)
+    for index in range(max(passes, 1)):
+        # второй и дальнейшие проходы ищут остаток: он в разы меньше, и
+        # широкий скан не нужен — четверть размаха первого
+        shrink = 1.0 if index == 0 else 0.25
+        segments = search_segments(backend, h_current, range_scale, rows, hop,
+                                   prescan_half=SEGMENT_PRESCAN_HALF_RAD * shrink,
+                                   cubic_half=SEGMENT_CUBIC_HALF_RAD * shrink)
         scene = apply_segments(backend, h_current, segments, range_scale)
         passes_out.append(segments)
         h_current = backend.xp.fft.ifft(scene, axis=0) / backend.alpha
