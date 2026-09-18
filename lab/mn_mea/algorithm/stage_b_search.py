@@ -120,6 +120,24 @@ PRESCAN_RANGE_STRIDE = 4
 #: дальности (R от 2650 до 4350) ошибается на +-25 % по краям.
 RANGE_POWER_OFFSET = 1
 
+#: ЗАКОН (R/R_B0)^(d-1) НЕ ПОДТВЕРДИЛСЯ и в конвейере не используется.
+#: Замер на крае кадра владельца, квадратичная по полосам дальности
+#: (кольцевые окна, R от 2650 до 3849 м, R/R_B0 от 0,79 до 1,15):
+#:
+#:   строки       стробы 0…1000  1000…2000  2000…3000  3000…4000  4000…5000
+#:   0…2048              90         115        115        135        145
+#:   1024…3072          105         140        160        145        340
+#:   2048…4096          410         365        390        335        995
+#:
+#: По дальности ошибка почти ровная, а в дальней полосе скачок в 2…2,5
+#: раза: продукт берёт скорость поблочно и по дальности тоже (матрица
+#: индексирована r_bin), и в дальней зоне у него своя, негодная оценка.
+#: Закон ∝R давал там +15 % вместо x2,5, а в ближней зоне занижал — на
+#: большом срезе владельца слева помогало, справа нет. Вместо закона —
+#: полосы по дальности: своя квадратичная на каждую, между полосами
+#: линейная интерполяция.
+RANGE_STRIP_GATES = 1000
+
 
 @dataclass
 class SearchResult:
@@ -460,14 +478,28 @@ SEGMENT_GRID_HALF_STEPS = 2
 
 @dataclass
 class SegmentResult:
-    """Поправка одного сегмента."""
+    """Поправка одного сегмента: по полосам дальности и сводная."""
 
     row_start: int
     row_stop: int
-    coefficients: dict[int, float]
+    coefficients: dict[int, float]                 # медиана по полосам, для печати
     entropy_start: float
     entropy_final: float
     n_evaluations: int
+    strips: list = field(default_factory=list)                # [(n_start, n_stop), …]
+    strip_coefficients: list = field(default_factory=list)    # [dict степень -> рад, …]
+
+
+def range_strips(N: int, gates: int = RANGE_STRIP_GATES) -> list[tuple[int, int]]:
+    """Полосы по дальности: по gates стробов, остаток короче половины — к последней."""
+    if N <= gates:
+        return [(0, N)]
+    starts = list(range(0, N, gates))
+    bounds = [(s, min(s + gates, N)) for s in starts]
+    if bounds[-1][1] - bounds[-1][0] < gates // 2 and len(bounds) > 1:
+        bounds[-2] = (bounds[-2][0], N)
+        bounds.pop()
+    return bounds
 
 
 def segment_bounds(M: int, rows: int = SEGMENT_ROWS, hop: int = SEGMENT_HOP) -> list[tuple[int, int]]:
@@ -498,7 +530,7 @@ def segment_data(backend: Backend, g_scene, start: int, stop: int,
     return backend.xp.fft.ifft(buffer, axis=0) / backend.alpha, pad
 
 
-def search_segments(backend: Backend, h, range_scale: np.ndarray | None = None,
+def search_segments(backend: Backend, h, range_scale=None,
                     rows: int = SEGMENT_ROWS, hop: int = SEGMENT_HOP,
                     floor_factor: float = C.SIGNAL_FLOOR_FACTOR,
                     floor_relative: float = C.POWER_FLOOR_RELATIVE,
@@ -507,8 +539,10 @@ def search_segments(backend: Backend, h, range_scale: np.ndarray | None = None,
                     degrees=DEGREES) -> list[SegmentResult]:
     """Посегментный поиск полинома: своя (P2, P3) на каждый сегмент азимута.
 
-    Принимает бэкенд, данные сцены h(k,n) и масштаб дальности; возвращает
-    список SegmentResult по сегментам (segment_bounds).
+    Принимает бэкенд и данные сцены h(k,n) (range_scale оставлен для
+    совместимости и не используется — см. RANGE_STRIP_GATES); возвращает
+    список SegmentResult по сегментам (segment_bounds), в каждом — своя
+    квадратичная на полосу дальности.
 
     Зачем не одна фаза на сцену: на крае кадра владельца квадратичная
     ошибка растёт вдоль азимута от 120 до 930 рад — одна поправка на
@@ -525,28 +559,38 @@ def search_segments(backend: Backend, h, range_scale: np.ndarray | None = None,
     _, edge, _ = band_axis(backend, h_device, floor_factor)
     g_scene = backend.fft_kernel_minus(h_device)
     bounds = segment_bounds(M, rows, hop)
+    strips = range_strips(N)
     widths = [segment_band_width(backend, g_scene, s, e)[0] for s, e in bounds]
     widest = max(widths) if widths else 1.0
     results = []
     for (start, stop), width in zip(bounds, widths):
+        zero = {d: 0.0 for d in DEGREES}
         if width < SEGMENT_BAND_MIN_FRACTION * widest:
-            results.append(SegmentResult(start, stop, {2: 0.0, 3: 0.0}, 0.0, 0.0, 0))
+            results.append(SegmentResult(start, stop, dict(zero), 0.0, 0.0, 0,
+                                         list(strips), [dict(zero) for _ in strips]))
             continue
         h_seg, pad = segment_data(backend, g_scene, start, stop,
                                   SEGMENT_SEARCH_PAD_FRACTION)
         L = h_seg.shape[0]
         f_seg = np.fft.fftfreq(L)
         u_seg = np.where(np.abs(f_seg) <= edge, f_seg / edge, 0.0)
-        result = search(backend, h_seg, degrees=degrees, range_scale=range_scale,
-                        prescan_half=prescan_half,
-                        prescan_step=SEGMENT_PRESCAN_STEP_RAD,
-                        cubic_prescan_half=cubic_half,
-                        grid_half_steps=SEGMENT_GRID_HALF_STEPS,
-                        band_override=u_seg)
-        coefficients = {d: result.coefficients.get(d, 0.0) for d in DEGREES}
-        results.append(SegmentResult(start, stop, coefficients,
-                                     result.entropy_start, result.entropy_final,
-                                     result.n_evaluations))
+        per_strip, S_start, S_final, n_eval = [], 0.0, 0.0, 0
+        for (a, b) in strips:
+            # своя квадратичная на полосу дальности; закон по дальности не
+            # задаётся — см. RANGE_STRIP_GATES
+            result = search(backend, h_seg[:, a:b], degrees=degrees,
+                            prescan_half=prescan_half,
+                            prescan_step=SEGMENT_PRESCAN_STEP_RAD,
+                            cubic_prescan_half=cubic_half,
+                            grid_half_steps=SEGMENT_GRID_HALF_STEPS,
+                            band_override=u_seg)
+            per_strip.append({d: result.coefficients.get(d, 0.0) for d in DEGREES})
+            S_start += result.entropy_start * (b - a) / N
+            S_final += result.entropy_final * (b - a) / N
+            n_eval += result.n_evaluations
+        summary = {d: float(np.median([c[d] for c in per_strip])) for d in DEGREES}
+        results.append(SegmentResult(start, stop, summary, S_start, S_final, n_eval,
+                                     list(strips), per_strip))
     return results
 
 
@@ -567,8 +611,9 @@ def coefficients_at(segments: list[SegmentResult], m: float,
                     edge_policy: str = SEGMENT_EDGE_POLICY) -> dict[int, float]:
     """Коэффициенты поправки в строке m — линейная интерполяция по центрам сегментов.
 
-    Принимает список поправок сегментов и строку; возвращает словарь
-    степень -> коэффициент. За крайними центрами — постоянно.
+    Принимает список поправок сегментов и строку; возвращает список по
+    полосам дальности словарей степень -> коэффициент. За крайними
+    центрами — постоянно.
 
     Сегменты, где поиск не делался (полоса урезана, n_evaluations = 0),
     при edge_policy 'hold' в интерполяцию не входят: поправка за последним
@@ -582,13 +627,20 @@ def coefficients_at(segments: list[SegmentResult], m: float,
     centres = np.array([(s.row_start + s.row_stop) / 2.0 for s in used])
     order = np.argsort(centres)
     degrees = sorted({d for s in used for d in s.coefficients})
-    return {d: float(np.interp(m, centres[order],
-                               np.array([used[i].coefficients.get(d, 0.0) for i in order])))
-            for d in degrees}
+    n_strips = len(used[0].strips) if used[0].strips else 0
+    if n_strips == 0:
+        return [{d: float(np.interp(m, centres[order],
+                                    np.array([used[i].coefficients.get(d, 0.0) for i in order])))
+                 for d in degrees}]
+    return [{d: float(np.interp(m, centres[order],
+                                np.array([used[i].strip_coefficients[j].get(d, 0.0)
+                                          for i in order])))
+             for d in degrees}
+            for j in range(n_strips)]
 
 
 def apply_segments(backend: Backend, h, segments: list[SegmentResult],
-                   range_scale: np.ndarray | None = None,
+                   range_scale=None,
                    floor_factor: float = C.SIGNAL_FLOOR_FACTOR,
                    tile_rows: int = TILE_ROWS, window_rows: int = APPLY_WINDOW_ROWS,
                    edge_policy: str = SEGMENT_EDGE_POLICY):
@@ -599,8 +651,9 @@ def apply_segments(backend: Backend, h, segments: list[SegmentResult],
 
     Для каждой плитки в tile_rows строк берётся окно window_rows строк
     вокруг неё (с нулевыми полями SEGMENT_PAD_FRACTION), исправляется
-    ОДНОЙ поправкой — коэффициентами, интерполированными на центр плитки,
-    — и в сцену идёт только плитка из середины окна.
+    ОДНОЙ по азимуту поправкой — коэффициентами, интерполированными на
+    центр плитки, по каждой полосе дальности своими, между полосами
+    линейно, — и в сцену идёт только плитка из середины окна.
 
     ПОЧЕМУ НЕ СКЛЕЙКА ОКНАМИ. Первая версия складывала сегменты, каждый
     со своей поправкой, с весами sin^2. Замер на крае кадра: цели в
@@ -617,10 +670,13 @@ def apply_segments(backend: Backend, h, segments: list[SegmentResult],
     g_scene = backend.fft_kernel_minus(h_device)
     xp = backend.xp
     out = xp.zeros_like(g_scene)
+    strips = segments[0].strips or [(0, N)]
+    strip_centres = np.array([(a + b) / 2.0 for a, b in strips])
+    n_axis = np.arange(N, dtype=np.float64)
     for t0 in range(0, M, tile_rows):
         t1 = min(t0 + tile_rows, M)
-        coefficients = coefficients_at(segments, (t0 + t1) / 2.0, edge_policy)
-        if all(abs(c) < 1e-9 for c in coefficients.values()):
+        per_strip = coefficients_at(segments, (t0 + t1) / 2.0, edge_policy)
+        if all(abs(c) < 1e-9 for coeffs in per_strip for c in coeffs.values()):
             out[t0:t1] = g_scene[t0:t1]
             continue
         w0 = max(0, min((t0 + t1) // 2 - window_rows // 2, M - window_rows))
@@ -629,10 +685,18 @@ def apply_segments(backend: Backend, h, segments: list[SegmentResult],
         L = h_seg.shape[0]
         f_seg = np.fft.fftfreq(L)
         u_seg = np.where(np.abs(f_seg) <= edge, f_seg / edge, 0.0)
-        phi_device = backend.asarray(polynomial_phase(u_seg, coefficients, range_scale))
-        if phi_device.ndim == 1:
-            phi_device = phi_device[:, None]
-        g_win = backend.fft_kernel_minus(h_seg * xp.exp(1j * phi_device))
+        # фаза (L, N): коэффициент каждой степени линейно интерполируется по
+        # дальности между центрами полос, за крайними — постоянен
+        phi = np.zeros((L, N), dtype=np.float64)
+        for degree in sorted({d for c in per_strip for d in c}):
+            values = np.array([c.get(degree, 0.0) for c in per_strip])
+            if not np.any(values):
+                continue
+            along_range = (np.interp(n_axis, strip_centres, values)
+                           if len(strips) > 1 else np.full(N, values[0]))
+            phi += legendre(u_seg, degree)[:, None] * along_range[None, :]
+        phi[u_seg == 0.0, :] = 0.0
+        g_win = backend.fft_kernel_minus(h_seg * xp.exp(1j * backend.asarray(phi)))
         out[t0:t1] = g_win[pad + (t0 - w0) : pad + (t1 - w0)]
     return out
 

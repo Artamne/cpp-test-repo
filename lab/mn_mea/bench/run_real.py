@@ -393,7 +393,10 @@ def focus(h: np.ndarray, geom: Geometry, grid: tuple[int, int] | None,
     initial, segments = None, None
     scene_corrected = scene
     if start == "polinom":
-        range_scale = BS.range_scale_axis(geom.R_B0, geom.r_b, N)
+        # закон масштаба по дальности не подтвердился (см.
+        # stage_b_search.RANGE_STRIP_GATES): сегменты ищут по полосам
+        # дальности, короткий срез — без масштаба
+        range_scale = None
         if M >= 2 * BS.SEGMENT_ROWS:
             # длинный срез: ошибка меняется вдоль азимута (край кадра
             # владельца: 120 -> 930 рад за 4000 строк), одна фаза на сцену
@@ -694,21 +697,24 @@ def main() -> int:
         for k, pass_ in enumerate(run["segments"]):
             print(f"  проход {k + 1}: окна {pass_['rows']} строк, шаг {pass_['hop']}"
                   + ", только квадратичная")
-            print(f"{'строки':>13} {'полоса -10дБ':>13} {'квадр., рад':>12} "
-                  f"{'куб., рад':>10} {'dS':>8} {'  что это'}")
+            strips = pass_["segments"][0].strips if pass_["segments"] else []
+            head = "".join(f"{a}…{b:<6}"[:12].rjust(12) for a, b in strips)
+            print(f"{'строки':>13} {'полоса':>7}  квадр. по полосам дальности (стробы), рад:"
+                  f"{head}   {'dS':>8}  что это")
             widest = max(w for w, _ in pass_["bands"]) if pass_["bands"] else 1.0
             for seg, (width, centre) in zip(pass_["segments"], pass_["bands"]):
+                quads = [1.5 * c.get(2, 0.0) for c in seg.strip_coefficients]
                 quad = 1.5 * seg.coefficients.get(2, 0.0)
-                cube = 2.5 * seg.coefficients.get(3, 0.0)
                 dS = seg.entropy_final - seg.entropy_start
                 note = ""
                 if width < BS.SEGMENT_BAND_MIN_FRACTION * widest:
                     note = "полоса урезана — апертура неполная, край кадра"
                 elif abs(quad) > 0.25 * phi_ap:
                     note = (f"ошибка {abs(quad)/phi_ap*100:.0f} % фазы апертуры — "
-                            "не движение, опорная функция продукта")
-                print(f"{seg.row_start:5d}…{seg.row_stop:<7d} {width*100:12.1f} % "
-                      f"{quad:+12.0f} {cube:+10.0f} {dS:+8.4f}  {note}")
+                            "опорная функция продукта")
+                print(f"{seg.row_start:5d}…{seg.row_stop:<7d} {width*100:5.1f} %  "
+                      + "".join(f"{q:+12.0f}" for q in quads)
+                      + f"   {dS:+8.4f}  {note}")
     else:
         print("начальная фаза нулевая (start=nol), этап B не делается")
     if run["donor"] is not None:
