@@ -4,7 +4,11 @@
 Глобальный код не трогает. Берёт комплексное изображение (.npy) и рисует
 рядом варианты показа, печатает по каждому числа. Запуск:
 
-    python bench/playground_kontrast.py путь/к/posle.npy [шаг_азимута_м] [шаг_дальности_м]
+    python bench/playground_kontrast.py путь/к/posle.npy [шаг_азимута_м] [шаг_дальности_м] [nabor=rezkie|myagkie]
+
+Набор rezkie (по умолчанию) — без пространственного сглаживания: тон,
+S-кривая, нерезкое маскирование, медиана 3x3. Набор myagkie — фильтры
+спекла (Ли, усиленный Ли), они мылят текстуру.
 
 Варианты (все — над одним и тем же изображением, окно показа по процентилям):
 
@@ -94,6 +98,23 @@ def lee_enhanced(I, win, looks):
     return np.where(ci >= cmax, I, out)
 
 
+def sigmoid_db(db, centre, slope):
+    """S-кривая в дБ: y = 1/(1+exp(-(db-centre)/slope)) — контраст в средних тонах без клиппинга."""
+    return 1.0 / (1.0 + np.exp(-(db - centre) / slope))
+
+
+def unsharp(db, win, amount):
+    """Нерезкое маскирование в дБ: db + amount*(db - среднее по окну)."""
+    return db + amount * (db - box_mean(db, win))
+
+
+def median3(a):
+    """Медиана 3x3 через сортировку девяти сдвигов — против одиночных выбросов, кромки целы."""
+    p = np.pad(a, 1, mode="reflect")
+    stack = np.stack([p[i:i + a.shape[0], j:j + a.shape[1]] for i in range(3) for j in range(3)])
+    return np.median(stack, axis=0)
+
+
 def to_db(I):
     return 10.0 * np.log10(np.maximum(I, I.max() * 1e-9))
 
@@ -114,8 +135,9 @@ def chisla(y, name):
 
 def main():
     path = pathlib.Path(sys.argv[1])
-    az = float(sys.argv[2]) if len(sys.argv) > 2 else AZ_STEP_M
-    rg = float(sys.argv[3]) if len(sys.argv) > 3 else RG_STEP_M
+    nums = [float(w) for w in sys.argv[2:] if "=" not in w]
+    az = nums[0] if len(nums) > 0 else AZ_STEP_M
+    rg = nums[1] if len(nums) > 1 else RG_STEP_M
     g = np.load(path)
     I = np.abs(g).astype(np.float64) ** 2
     print(f"{path.name}: {g.shape}, многовзгляд x{LOOKS_AZ} -> {I.shape[0]//LOOKS_AZ} строк, "
@@ -126,6 +148,27 @@ def main():
     db_fl = to_db(I_fl)
     local = box_mean(db_fl, LOCAL_WIN)
     db_loc = db_fl - 0.5 * (local - local.mean())          # вполсилы: озеро остаётся тёмным
+    nabor = "rezkie"
+    for w in sys.argv[2:]:
+        if w.startswith("nabor="):
+            nabor = w.split("=", 1)[1]
+    if nabor == "rezkie":
+        # РЕЗКИЕ: никакого пространственного сглаживания, только тон и подчёркивание
+        med = np.percentile(db_fl, 50)
+        variants = [
+            ("а  дБ P5-P97, как сейчас (уменьшено x7)", multilook_az(window(to_db(I), 5, 97), LOOKS_AZ), 1),
+            ("б  x7 по интенсивности + выравнивание, дБ P5-P97", window(db_fl, 5, 97), 1),
+            ("в  б + S-кривая (центр медиана, наклон 4 дБ)", sigmoid_db(db_fl, med, 4.0), 1),
+            ("г  б + S-кривая, наклон 6 дБ", sigmoid_db(db_fl, med, 6.0), 1),
+            ("д  б + нерезкое маскирование 9x9, 0,6", window(unsharp(db_fl, (9, 9), 0.6), 3, 99), 1),
+            ("е  в + нерезкое маскирование 9x9, 0,4", sigmoid_db(unsharp(db_fl, (9, 9), 0.4), med, 4.0), 1),
+            ("ж  б + медиана 3x3 (только выбросы) + S 4 дБ", sigmoid_db(median3(db_fl), med, 4.0), 1),
+            ("з  б + нормировка большим окном 512x128 x0,3 + S 5 дБ",
+             sigmoid_db(db_fl - 0.3 * (box_mean(db_fl, (512, 128)) - med), med, 5.0), 1),
+        ]
+        krupno_name = "kontrast_rezkie_krupno.png"; sheet_name = "kontrast_rezkie.png"
+    else:
+        krupno_name = "kontrast_krupno.png"; sheet_name = "kontrast_varianty.png"
     L = ENL_AFTER_ML
     I_lee7 = lee(I_fl, 7, L)
     I_lee11 = lee(I_fl, 11, L)
@@ -134,7 +177,8 @@ def main():
     I_72 = multilook_rg(I_fl, 2)
     I_72_enh = lee_enhanced(I_72, 9, 1.33)
 
-    variants = [
+    if nabor != "rezkie":
+      variants = [
         ("а  дБ P5-P97, как сейчас (уменьшено x7)", multilook_az(window(to_db(I), 5, 97), LOOKS_AZ), 1),
         ("б  x7 + выравнивание по дальности, дБ P5-P97", window(db_fl, 5, 97), 1),
         ("в  б + Ли 7x7, L = 1,09 (замер)", window(to_db(I_lee7), 5, 97), 1),
@@ -143,7 +187,7 @@ def main():
         ("е  б + усиленный Ли 15x15", window(to_db(I_enh15), 5, 97), 1),
         ("ж  б + x2 по дальности + усиленный Ли 9x9", window(to_db(I_72_enh), 5, 97), 2),
         ("з  д, но окно P2-P99.5 и гамма 0.85", window(to_db(I_enh9), 2, 99.5, 0.85), 1),
-    ]
+      ]
     print("\nчисла по показанному (0…1), весь кадр:")
     for name, y, _ in variants:
         chisla(y, name)
@@ -169,7 +213,7 @@ def main():
     for i, (name, t) in enumerate(tiles):
         x, y0 = (i % cols) * (W + 10), (i // cols) * (H + 28)
         sheet.paste(t, (x, y0 + 24)); d.text((x + 4, y0 + 4), name, fill=255, font=font)
-    out = path.with_name("kontrast_varianty.png"); sheet.save(out)
+    out = path.with_name(sheet_name); sheet.save(out)
 
     # лист 2: кроп 1:1 (после многовзгляда) — центр кадра 300 строк x 400 стробов, масштаб 1,5
     m0, n0 = I_ml.shape[0] // 2 - 150, I_ml.shape[1] // 2 - 200
@@ -183,7 +227,7 @@ def main():
     for i, (name, t) in enumerate(tiles):
         x, y0 = (i % cols) * (W + 10), (i // cols) * (H + 28)
         sheet2.paste(t, (x, y0 + 24)); d2.text((x + 4, y0 + 4), name, fill=255, font=font)
-    out2 = path.with_name("kontrast_krupno.png"); sheet2.save(out2)
+    out2 = path.with_name(krupno_name); sheet2.save(out2)
     print(f"\nлист вариантов (весь кадр): {out}\nкроп 1:1 (центр 120 x 120 м): {out2}")
 
 
