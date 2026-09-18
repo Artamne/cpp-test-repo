@@ -496,7 +496,8 @@ def search_segments(backend: Backend, h, range_scale: np.ndarray | None = None,
                     floor_factor: float = C.SIGNAL_FLOOR_FACTOR,
                     floor_relative: float = C.POWER_FLOOR_RELATIVE,
                     prescan_half: float = SEGMENT_PRESCAN_HALF_RAD,
-                    cubic_half: float = SEGMENT_CUBIC_HALF_RAD) -> list[SegmentResult]:
+                    cubic_half: float = SEGMENT_CUBIC_HALF_RAD,
+                    degrees=DEGREES) -> list[SegmentResult]:
     """Посегментный поиск полинома: своя (P2, P3) на каждый сегмент азимута.
 
     Принимает бэкенд, данные сцены h(k,n) и масштаб дальности; возвращает
@@ -529,13 +530,14 @@ def search_segments(backend: Backend, h, range_scale: np.ndarray | None = None,
         L = h_seg.shape[0]
         f_seg = np.fft.fftfreq(L)
         u_seg = np.where(np.abs(f_seg) <= edge, f_seg / edge, 0.0)
-        result = search(backend, h_seg, range_scale=range_scale,
+        result = search(backend, h_seg, degrees=degrees, range_scale=range_scale,
                         prescan_half=prescan_half,
                         prescan_step=SEGMENT_PRESCAN_STEP_RAD,
                         cubic_prescan_half=cubic_half,
                         grid_half_steps=SEGMENT_GRID_HALF_STEPS,
                         band_override=u_seg)
-        results.append(SegmentResult(start, stop, dict(result.coefficients),
+        coefficients = {d: result.coefficients.get(d, 0.0) for d in DEGREES}
+        results.append(SegmentResult(start, stop, coefficients,
                                      result.entropy_start, result.entropy_final,
                                      result.n_evaluations))
     return results
@@ -627,6 +629,29 @@ def apply_segments(backend: Backend, h, segments: list[SegmentResult],
 #: ничего не добавлял.
 SEGMENT_PASSES = 2
 
+#: ПЕРВЫЙ ПРОХОД — ТОЛЬКО КВАДРАТИЧНАЯ. Замер на крае кадра владельца,
+#: скан по окнам с центрами 1024 / 1536 / 2048 строк:
+#:
+#:   только квадратичная            120 / 130 / 160 рад
+#:   квадратичная + кубическая      125 / 150 / 174 рад, кубическая -24…-53
+#:
+#: Цели в этих строках резки при 125…135: совместная подгонка завышает
+#: квадратичную и добавляет кубическую, которая одна ухудшает цели с 8,0
+#: до 12,2 элемента по -20 дБ (вместе — до 19,2). При квадратичной в
+#: сотни радиан кубическая в кольцевом окне ловит шум. Она ищется на
+#: втором проходе, когда остаток мал, и в узких пределах.
+FIRST_PASS_DEGREES = (2,)
+
+#: ВТОРОЙ ПРОХОД — окна вдвое короче и шаг в четверть: остаток после
+#: первого прохода — десятки радиан, размаз +-100…300 строк, и окно в 1024
+#: строки его накрывает, а профиль видит вдвое мельче. Замер: окна 1024
+#: и 512 строк на крае кадра дают тот же профиль, что 2048 (dS -0,11 /
+#: -0,09 против -0,12), пока ошибка не больше ~300 рад.
+SECOND_PASS_ROWS = 1024
+SECOND_PASS_HOP = 256
+SECOND_PASS_PRESCAN_HALF_RAD = 150.0
+SECOND_PASS_CUBIC_HALF_RAD = 60.0
+
 
 def segment_band_width(backend: Backend, g_scene, start: int, stop: int) -> tuple[float, float]:
     """Ширина полосы -10 дБ и её центр в сегменте, в долях частоты повторения.
@@ -653,8 +678,10 @@ def correct_segments(backend: Backend, h, range_scale: np.ndarray | None = None,
     """Посегментная поправка в несколько проходов.
 
     Принимает бэкенд, данные сцены и масштаб дальности; возвращает
-    (исправленное изображение сцены на устройстве, список проходов, где
-    каждый проход — список SegmentResult, полоса по сегментам).
+    (исправленное изображение сцены на устройстве, список проходов; проход
+    — словарь: segments, bands (полоса по сегментам), rows, hop).
+    Первый проход — только квадратичная в длинных окнах (FIRST_PASS_*),
+    второй — квадратичная и малая кубическая в коротких (SECOND_PASS_*).
 
     Каждый проход: search_segments на текущих данных, apply_segments,
     и следующий проход идёт по исправленной сцене (обратное ПФ по азимуту
@@ -664,16 +691,25 @@ def correct_segments(backend: Backend, h, range_scale: np.ndarray | None = None,
     passes_out = []
     scene = None
     for index in range(max(passes, 1)):
-        # второй и дальнейшие проходы ищут остаток: он в разы меньше, и
-        # широкий скан не нужен — четверть размаха первого
-        shrink = 1.0 if index == 0 else 0.25
-        segments = search_segments(backend, h_current, range_scale, rows, hop,
-                                   prescan_half=SEGMENT_PRESCAN_HALF_RAD * shrink,
-                                   cubic_half=SEGMENT_CUBIC_HALF_RAD * shrink)
+        if index == 0:
+            # грубо: длинные окна, только квадратичная, широкий скан
+            segments = search_segments(backend, h_current, range_scale, rows, hop,
+                                       prescan_half=SEGMENT_PRESCAN_HALF_RAD,
+                                       cubic_half=0.0, degrees=FIRST_PASS_DEGREES)
+            rows_used, hop_used = rows, hop
+        else:
+            # остаток: короткие окна, квадратичная и малая кубическая
+            segments = search_segments(backend, h_current, range_scale,
+                                       SECOND_PASS_ROWS, SECOND_PASS_HOP,
+                                       prescan_half=SECOND_PASS_PRESCAN_HALF_RAD,
+                                       cubic_half=SECOND_PASS_CUBIC_HALF_RAD,
+                                       degrees=DEGREES)
+            rows_used, hop_used = SECOND_PASS_ROWS, SECOND_PASS_HOP
         scene = apply_segments(backend, h_current, segments, range_scale)
-        passes_out.append(segments)
+        g_now = backend.fft_kernel_minus(h_current)
+        bands = [segment_band_width(backend, g_now, s.row_start, s.row_stop)
+                 for s in segments]
+        passes_out.append({"segments": segments, "bands": bands,
+                           "rows": rows_used, "hop": hop_used})
         h_current = backend.xp.fft.ifft(scene, axis=0) / backend.alpha
-    g_scene = backend.fft_kernel_minus(backend.asarray(h))
-    bands = [segment_band_width(backend, g_scene, s.row_start, s.row_stop)
-             for s in passes_out[0]]
-    return scene, passes_out, bands
+    return scene, passes_out
