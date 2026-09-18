@@ -39,7 +39,8 @@
     segment_bounds     границы сегментов по азимуту
     segment_data       сегмент сцены с полями в области дальность-доплер
     search_segments    своя (P2, P3) на каждый сегмент
-    apply_segments     исправленная сцена, склейка сегментов окнами sin^2
+    coefficients_at    поправка в строке m — интерполяция по центрам сегментов
+    apply_segments     исправленная сцена: перекрытие с сохранением, одна поправка на плитку
 """
 
 from __future__ import annotations
@@ -540,18 +541,57 @@ def search_segments(backend: Backend, h, range_scale: np.ndarray | None = None,
     return results
 
 
+#: Плитка выдачи при применении поправки, строк. Поправка кусочно-постоянна
+#: по плитке: на самом крутом участке края кадра (577 -> 767 рад за 1024
+#: строки) соседние плитки по 128 строк отличаются на 24 рад — цель на
+#: стыке видит скачок в 24 рад между половинами, это терпимо.
+TILE_ROWS = 128
+
+#: Окно вокруг плитки при применении, строк: плитка берётся из его середины,
+#: и края окна (где поправка портит содержимое) до неё не достают, пока
+#: размаз меньше половины окна минус полплитки — при 4096 это +-1980 строк,
+#: то есть до ~770 рад квадратичной на этой записи.
+APPLY_WINDOW_ROWS = 4096
+
+
+def coefficients_at(segments: list[SegmentResult], m: float) -> dict[int, float]:
+    """Коэффициенты поправки в строке m — линейная интерполяция по центрам сегментов.
+
+    Принимает список поправок сегментов и строку; возвращает словарь
+    степень -> коэффициент. За крайними центрами — постоянно. Сегменты с
+    урезанной полосой несут нули и участвуют как нули: поправка к краю
+    кадра плавно сходит на нет, а не обрывается.
+    """
+    centres = np.array([(s.row_start + s.row_stop) / 2.0 for s in segments])
+    order = np.argsort(centres)
+    degrees = sorted({d for s in segments for d in s.coefficients})
+    return {d: float(np.interp(m, centres[order],
+                               np.array([segments[i].coefficients.get(d, 0.0) for i in order])))
+            for d in degrees}
+
+
 def apply_segments(backend: Backend, h, segments: list[SegmentResult],
                    range_scale: np.ndarray | None = None,
-                   floor_factor: float = C.SIGNAL_FLOOR_FACTOR):
-    """Исправленная сцена: каждый сегмент со своей поправкой, склейка окнами sin^2.
+                   floor_factor: float = C.SIGNAL_FLOOR_FACTOR,
+                   tile_rows: int = TILE_ROWS, window_rows: int = APPLY_WINDOW_ROWS):
+    """Исправленная сцена: перекрытие с сохранением, одна поправка на плитку.
 
     Принимает бэкенд, данные сцены и список поправок; возвращает
     изображение сцены (M, N) на устройстве, готовое к нарезке на блоки.
 
-    Сегмент исправляется в своей области дальность-доплер (с полями), из
-    него берётся середина без полей, домножается на окно sin^2 и
-    складывается в сцену; сумма окон при шаге в полсегмента равна единице
-    внутри, у краёв сцены нормируется явно.
+    Для каждой плитки в tile_rows строк берётся окно window_rows строк
+    вокруг неё (с нулевыми полями SEGMENT_PAD_FRACTION), исправляется
+    ОДНОЙ поправкой — коэффициентами, интерполированными на центр плитки,
+    — и в сцену идёт только плитка из середины окна.
+
+    ПОЧЕМУ НЕ СКЛЕЙКА ОКНАМИ. Первая версия складывала сегменты, каждый
+    со своей поправкой, с весами sin^2. Замер на крае кадра: цели в
+    строках 1368…1798 после такой склейки стали ШИРЕ (8,0 -> 20 элементов
+    по -20 дБ), хотя одна поправка на всю сцену давала там 4,0. В одной
+    строке складывались четыре версии цели, исправленные фазами 125, 150,
+    174 и 263 рад, — комплексные картинки с разной остаточной фазой
+    интерферируют, и сумма резкой не бывает. Здесь на строку приходится
+    ровно одна поправка, складывать нечего.
     """
     h_device = backend.asarray(h)
     M, N = h_device.shape
@@ -559,25 +599,24 @@ def apply_segments(backend: Backend, h, segments: list[SegmentResult],
     g_scene = backend.fft_kernel_minus(h_device)
     xp = backend.xp
     out = xp.zeros_like(g_scene)
-    weight = xp.zeros((M, 1), dtype=backend.real_dtype)
-    for seg in segments:
-        start, stop = seg.row_start, seg.row_stop
-        h_seg, pad = segment_data(backend, g_scene, start, stop)
+    for t0 in range(0, M, tile_rows):
+        t1 = min(t0 + tile_rows, M)
+        coefficients = coefficients_at(segments, (t0 + t1) / 2.0)
+        if all(abs(c) < 1e-9 for c in coefficients.values()):
+            out[t0:t1] = g_scene[t0:t1]
+            continue
+        w0 = max(0, min((t0 + t1) // 2 - window_rows // 2, M - window_rows))
+        w1 = min(M, w0 + window_rows)
+        h_seg, pad = segment_data(backend, g_scene, w0, w1)
         L = h_seg.shape[0]
         f_seg = np.fft.fftfreq(L)
         u_seg = np.where(np.abs(f_seg) <= edge, f_seg / edge, 0.0)
-        phi = polynomial_phase(u_seg, seg.coefficients, range_scale)
-        phi_device = backend.asarray(phi)
+        phi_device = backend.asarray(polynomial_phase(u_seg, coefficients, range_scale))
         if phi_device.ndim == 1:
             phi_device = phi_device[:, None]
-        g_seg = backend.fft_kernel_minus(h_seg * xp.exp(1j * phi_device))
-        rows = stop - start
-        window = xp.asarray(np.sin(np.pi * (np.arange(rows) + 0.5) / rows) ** 2,
-                            dtype=backend.real_dtype)[:, None]
-        out[start:stop] += g_seg[pad : pad + rows] * window
-        weight[start:stop] += window
-    weight = xp.maximum(weight, 1e-6)
-    return out / weight
+        g_win = backend.fft_kernel_minus(h_seg * xp.exp(1j * phi_device))
+        out[t0:t1] = g_win[pad + (t0 - w0) : pad + (t1 - w0)]
+    return out
 
 
 #: Проходов посегментной поправки. Внутри сегмента ошибка не одна, а плавно
